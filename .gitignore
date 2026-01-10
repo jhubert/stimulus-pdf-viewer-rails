@@ -1,0 +1,26 @@
+# Bundler
+/.bundle/
+/vendor/bundle
+
+# Gem build
+*.gem
+/pkg/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Test coverage
+/coverage/
+
+# Gemfile.lock (for gems)
+Gemfile.lock
