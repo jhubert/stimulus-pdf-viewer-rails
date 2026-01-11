@@ -191,11 +191,25 @@ pin "@rails/request.js", to: "@rails--request.js.js" # Usually already pinned
 
 ## Updating the Vendored Assets
 
-When a new version of stimulus-pdf-viewer is released:
+Check for newer versions:
 
-1. Update `STIMULUS_PDF_VIEWER_VERSION` in `lib/stimulus_pdf_viewer/rails/version.rb`
-2. Download the new dist files from npm or build from source
-3. Replace the files in `app/assets/javascripts/` and `app/assets/stylesheets/`
+```bash
+rake stimulus_pdf_viewer:check
+```
+
+Update to the latest version:
+
+```bash
+rake stimulus_pdf_viewer:update
+```
+
+Update to a specific version:
+
+```bash
+rake stimulus_pdf_viewer:update[0.2.0]
+```
+
+The rake task will download the package from npm, copy the dist files, and update `STIMULUS_PDF_VIEWER_VERSION` in `lib/stimulus_pdf_viewer/rails/version.rb`.
 
 ## License
 
