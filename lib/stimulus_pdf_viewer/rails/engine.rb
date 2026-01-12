@@ -7,7 +7,6 @@ module StimulusPdfViewer
         # Add our assets to the asset paths
         app.config.assets.paths << root.join("app/assets/javascripts")
         app.config.assets.paths << root.join("app/assets/stylesheets")
-        app.config.assets.paths << root.join("app/assets/images")
 
         # Precompile the main JS file
         app.config.assets.precompile += %w[

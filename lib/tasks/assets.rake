@@ -28,9 +28,6 @@ class StimulusPdfViewerAssetUpdater
     "styles/pdf-viewer.scss" => "app/assets/stylesheets/stimulus-pdf-viewer.scss"
   }.freeze
 
-  CURSOR_SOURCE_DIR = "assets/cursors"
-  CURSOR_DEST_DIR = "app/assets/images/stimulus-pdf-viewer"
-
   def initialize(version)
     @requested_version = version
   end
@@ -124,25 +121,6 @@ class StimulusPdfViewerAssetUpdater
 
       FileUtils.cp(src_path, dest_path)
       puts "  #{src} -> #{dest}"
-    end
-
-    copy_cursors(package_dir)
-  end
-
-  def copy_cursors(package_dir)
-    cursor_src = File.join(package_dir, CURSOR_SOURCE_DIR)
-    cursor_dest = File.join(GEM_ROOT, CURSOR_DEST_DIR)
-
-    unless Dir.exist?(cursor_src)
-      warn "  Warning: #{CURSOR_SOURCE_DIR} not found in package"
-      return
-    end
-
-    FileUtils.mkdir_p(cursor_dest)
-
-    Dir.glob(File.join(cursor_src, "*.svg")).each do |svg|
-      FileUtils.cp(svg, cursor_dest)
-      puts "  #{CURSOR_SOURCE_DIR}/#{File.basename(svg)} -> #{CURSOR_DEST_DIR}/"
     end
   end
 

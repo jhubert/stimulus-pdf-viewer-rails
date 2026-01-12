@@ -7956,7 +7956,8 @@ class pdf_viewer_controller extends Controller {
     documentId: String,
     trackingUrl: String,
     initialPage: Number,
-    initialAnnotation: String
+    initialAnnotation: String,
+    autoHeight: { type: Boolean, default: true }
   }
 
   initialize() {
@@ -8422,8 +8423,8 @@ class pdf_viewer_controller extends Controller {
 
   setViewportHeight() {
     requestAnimationFrame(() => {
-      // Skip if using CSS flexbox layout (document-fullscreen wrapper handles sizing)
-      if (this.containerTarget.closest('.document-fullscreen')) {
+      // Skip if autoHeight is disabled (container height managed by consuming application)
+      if (!this.autoHeightValue) {
         return
       }
 
@@ -8510,40 +8511,5 @@ class pdf_download_controller extends Controller {
   }
 }
 
-class pdf_sync_scroll_controller extends Controller {
-  static targets = ["container", "toggle"]
-
-  connect() {
-    this.isSyncing = false;
-  }
-
-  sync(event) {
-    if (this.isSyncing) return
-    if (!this.toggleTarget.checked) return
-
-    const master = event.currentTarget;
-    const slave = this.containerTargets.find(target => target !== master);
-
-    if (!slave) return
-
-    this.isSyncing = true;
-
-    // Calculate percentage-based scroll to account for potential
-    // differences in zoom levels or page counts
-    const scrollPercentageY = master.scrollTop / (master.scrollHeight - master.clientHeight);
-    const scrollPercentageX = master.scrollLeft / (master.scrollWidth - master.clientWidth);
-
-    window.requestAnimationFrame(() => {
-      slave.scrollTop = scrollPercentageY * (slave.scrollHeight - slave.clientHeight);
-      slave.scrollLeft = scrollPercentageX * (slave.scrollWidth - slave.clientWidth);
-
-      // Reset the lock after the browser paint
-      window.requestAnimationFrame(() => {
-        this.isSyncing = false;
-      });
-    });
-  }
-}
-
-export { AnnotationStore, CoreViewer, MemoryAnnotationStore, pdf_download_controller as PdfDownloadController, pdf_sync_scroll_controller as PdfSyncScrollController, PdfViewer, pdf_viewer_controller as PdfViewerController, RestAnnotationStore, ToolMode, ViewerEvents };
+export { AnnotationStore, CoreViewer, MemoryAnnotationStore, pdf_download_controller as PdfDownloadController, PdfViewer, pdf_viewer_controller as PdfViewerController, RestAnnotationStore, ToolMode, ViewerEvents };
 //# sourceMappingURL=stimulus-pdf-viewer.esm.js.map

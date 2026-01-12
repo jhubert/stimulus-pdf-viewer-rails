@@ -7976,7 +7976,8 @@
       documentId: String,
       trackingUrl: String,
       initialPage: Number,
-      initialAnnotation: String
+      initialAnnotation: String,
+      autoHeight: { type: Boolean, default: true }
     }
 
     initialize() {
@@ -8442,8 +8443,8 @@
 
     setViewportHeight() {
       requestAnimationFrame(() => {
-        // Skip if using CSS flexbox layout (document-fullscreen wrapper handles sizing)
-        if (this.containerTarget.closest('.document-fullscreen')) {
+        // Skip if autoHeight is disabled (container height managed by consuming application)
+        if (!this.autoHeightValue) {
           return
         }
 
@@ -8530,46 +8531,10 @@
     }
   }
 
-  class pdf_sync_scroll_controller extends stimulus.Controller {
-    static targets = ["container", "toggle"]
-
-    connect() {
-      this.isSyncing = false;
-    }
-
-    sync(event) {
-      if (this.isSyncing) return
-      if (!this.toggleTarget.checked) return
-
-      const master = event.currentTarget;
-      const slave = this.containerTargets.find(target => target !== master);
-
-      if (!slave) return
-
-      this.isSyncing = true;
-
-      // Calculate percentage-based scroll to account for potential
-      // differences in zoom levels or page counts
-      const scrollPercentageY = master.scrollTop / (master.scrollHeight - master.clientHeight);
-      const scrollPercentageX = master.scrollLeft / (master.scrollWidth - master.clientWidth);
-
-      window.requestAnimationFrame(() => {
-        slave.scrollTop = scrollPercentageY * (slave.scrollHeight - slave.clientHeight);
-        slave.scrollLeft = scrollPercentageX * (slave.scrollWidth - slave.clientWidth);
-
-        // Reset the lock after the browser paint
-        window.requestAnimationFrame(() => {
-          this.isSyncing = false;
-        });
-      });
-    }
-  }
-
   exports.AnnotationStore = AnnotationStore;
   exports.CoreViewer = CoreViewer;
   exports.MemoryAnnotationStore = MemoryAnnotationStore;
   exports.PdfDownloadController = pdf_download_controller;
-  exports.PdfSyncScrollController = pdf_sync_scroll_controller;
   exports.PdfViewer = PdfViewer;
   exports.PdfViewerController = pdf_viewer_controller;
   exports.RestAnnotationStore = RestAnnotationStore;
