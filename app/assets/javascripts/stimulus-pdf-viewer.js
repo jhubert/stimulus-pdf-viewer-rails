@@ -1270,6 +1270,264 @@
     }
   }
 
+  /**
+   * Base class for annotation storage implementations.
+   *
+   * Subclasses must implement all methods to provide persistence for annotations.
+   * The AnnotationManager delegates all storage operations to a store instance.
+   *
+   * @example
+   * class MyCustomStore extends AnnotationStore {
+   *   async load() { return fetch('/my-api/annotations').then(r => r.json()) }
+   *   async create(data) { ... }
+   *   // ... etc
+   * }
+   */
+  class AnnotationStore {
+    /**
+     * Load all annotations.
+     * @returns {Promise<Array>} Array of annotation objects
+     */
+    async load() {
+      throw new Error("AnnotationStore.load() not implemented")
+    }
+
+    /**
+     * Create a new annotation.
+     * @param {Object} data - Annotation data (without id)
+     * @returns {Promise<Object>} Created annotation with server-assigned id
+     */
+    async create(data) {
+      throw new Error("AnnotationStore.create() not implemented")
+    }
+
+    /**
+     * Update an existing annotation.
+     * @param {string|number} id - Annotation id
+     * @param {Object} data - Fields to update
+     * @returns {Promise<Object>} Updated annotation
+     */
+    async update(id, data) {
+      throw new Error("AnnotationStore.update() not implemented")
+    }
+
+    /**
+     * Delete an annotation.
+     * @param {string|number} id - Annotation id
+     * @returns {Promise<Object>} Deleted annotation
+     */
+    async delete(id) {
+      throw new Error("AnnotationStore.delete() not implemented")
+    }
+
+    /**
+     * Restore a soft-deleted annotation.
+     * @param {string|number} id - Annotation id
+     * @returns {Promise<Object>} Restored annotation
+     */
+    async restore(id) {
+      throw new Error("AnnotationStore.restore() not implemented")
+    }
+  }
+
+  /**
+   * REST API annotation store with configurable URL patterns.
+   *
+   * By default, uses Rails-style REST conventions:
+   * - GET    {baseUrl}.json           - load all
+   * - POST   {baseUrl}                - create
+   * - PATCH  {baseUrl}/{id}           - update
+   * - DELETE {baseUrl}/{id}           - delete
+   * - PATCH  {baseUrl}/{id}/restore   - restore
+   *
+   * URL patterns can be customized via function options:
+   *
+   * @example
+   * // Rails default (just provide baseUrl)
+   * new RestAnnotationStore({ baseUrl: '/documents/123/annotations' })
+   *
+   * @example
+   * // Custom URL patterns
+   * new RestAnnotationStore({
+   *   baseUrl: '/api/annotations',
+   *   loadUrl: () => '/api/annotations',  // no .json suffix
+   *   updateUrl: (id) => `/api/annotations/${id}/edit`
+   * })
+   *
+   * @example
+   * // Fully custom URLs with closures
+   * const docId = 123
+   * new RestAnnotationStore({
+   *   loadUrl: () => `/api/v2/documents/${docId}/annotations`,
+   *   createUrl: () => `/api/v2/documents/${docId}/annotations`,
+   *   updateUrl: (id) => `/api/v2/annotations/${id}`,
+   *   deleteUrl: (id) => `/api/v2/annotations/${id}`,
+   *   restoreUrl: (id) => `/api/v2/annotations/${id}/restore`
+   * })
+   */
+  class RestAnnotationStore extends AnnotationStore {
+    /**
+     * @param {Object} options
+     * @param {string} [options.baseUrl] - Base URL for Rails-style defaults
+     * @param {Function} [options.loadUrl] - () => string - URL for loading annotations
+     * @param {Function} [options.createUrl] - () => string - URL for creating annotations
+     * @param {Function} [options.updateUrl] - (id) => string - URL for updating annotations
+     * @param {Function} [options.deleteUrl] - (id) => string - URL for deleting annotations
+     * @param {Function} [options.restoreUrl] - (id) => string - URL for restoring annotations
+     */
+    constructor(options = {}) {
+      super();
+      this.baseUrl = options.baseUrl;
+
+      // Function-based URL builders with Rails-style defaults
+      this.getLoadUrl = options.loadUrl || (() => `${this.baseUrl}.json`);
+      this.getCreateUrl = options.createUrl || (() => this.baseUrl);
+      this.getUpdateUrl = options.updateUrl || ((id) => `${this.baseUrl}/${id}`);
+      this.getDeleteUrl = options.deleteUrl || ((id) => `${this.baseUrl}/${id}`);
+      this.getRestoreUrl = options.restoreUrl || ((id) => `${this.baseUrl}/${id}/restore`);
+    }
+
+    async load() {
+      const request = new request_js.FetchRequest("get", this.getLoadUrl());
+      const response = await request.perform();
+
+      if (response.ok) {
+        return await response.json
+      } else {
+        throw new Error("Failed to load annotations")
+      }
+    }
+
+    async create(data) {
+      const request = new request_js.FetchRequest("post", this.getCreateUrl(), {
+        body: JSON.stringify({ annotation: data }),
+        contentType: "application/json",
+        responseKind: "json"
+      });
+
+      const response = await request.perform();
+
+      if (response.ok) {
+        return await response.json
+      } else {
+        throw new Error("Failed to create annotation")
+      }
+    }
+
+    async update(id, data) {
+      const request = new request_js.FetchRequest("patch", this.getUpdateUrl(id), {
+        body: JSON.stringify({ annotation: data }),
+        contentType: "application/json",
+        responseKind: "json"
+      });
+
+      const response = await request.perform();
+
+      if (response.ok) {
+        return await response.json
+      } else {
+        throw new Error("Failed to update annotation")
+      }
+    }
+
+    async delete(id) {
+      const request = new request_js.FetchRequest("delete", this.getDeleteUrl(id), {
+        responseKind: "json"
+      });
+
+      const response = await request.perform();
+
+      if (response.ok) {
+        return await response.json
+      } else {
+        throw new Error("Failed to delete annotation")
+      }
+    }
+
+    async restore(id) {
+      const request = new request_js.FetchRequest("patch", this.getRestoreUrl(id), {
+        responseKind: "json"
+      });
+
+      const response = await request.perform();
+
+      if (response.ok) {
+        return await response.json
+      } else {
+        throw new Error("Failed to restore annotation")
+      }
+    }
+  }
+
+  /**
+   * In-memory annotation store for development and demo purposes.
+   *
+   * Annotations are stored in memory only and lost on page refresh.
+   * Useful for:
+   * - Local development without a backend
+   * - Demo/preview modes
+   * - Testing
+   *
+   * @example
+   * new MemoryAnnotationStore()
+   */
+  class MemoryAnnotationStore extends AnnotationStore {
+    constructor() {
+      super();
+      this._annotations = [];
+      this._nextId = 1;
+    }
+
+    async load() {
+      return [...this._annotations]
+    }
+
+    async create(data) {
+      const annotation = {
+        ...data,
+        id: `local-${this._nextId++}`,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      };
+
+      this._annotations.push(annotation);
+      return annotation
+    }
+
+    async update(id, data) {
+      const index = this._annotations.findIndex(a => a.id === id);
+      if (index === -1) {
+        throw new Error("Annotation not found")
+      }
+
+      const annotation = {
+        ...this._annotations[index],
+        ...data,
+        id, // Preserve original id
+        updated_at: new Date().toISOString()
+      };
+
+      this._annotations[index] = annotation;
+      return annotation
+    }
+
+    async delete(id) {
+      const index = this._annotations.findIndex(a => a.id === id);
+      if (index === -1) {
+        throw new Error("Annotation not found")
+      }
+
+      const [annotation] = this._annotations.splice(index, 1);
+      return annotation
+    }
+
+    async restore(id) {
+      // Memory store doesn't support soft-delete/restore
+      console.warn("MemoryAnnotationStore.restore() is not supported");
+      return null
+    }
+  }
+
   // Custom event types for error handling
   const AnnotationErrorType = {
     LOAD_FAILED: "load_failed",
@@ -1280,13 +1538,31 @@
   };
 
   class AnnotationManager {
+    /**
+     * @param {Object} options
+     * @param {AnnotationStore} [options.store] - Custom store implementation
+     * @param {string} [options.annotationsUrl] - Base URL for REST store (creates RestAnnotationStore)
+     * @param {number} [options.documentId] - Document ID
+     * @param {Function} [options.onAnnotationCreated] - Callback when annotation created
+     * @param {Function} [options.onAnnotationUpdated] - Callback when annotation updated
+     * @param {Function} [options.onAnnotationDeleted] - Callback when annotation deleted
+     * @param {Element} [options.eventTarget] - Element for dispatching error events
+     */
     constructor(options = {}) {
-      this.annotationsUrl = options.annotationsUrl;
       this.documentId = options.documentId;
       this.onAnnotationCreated = options.onAnnotationCreated;
       this.onAnnotationUpdated = options.onAnnotationUpdated;
       this.onAnnotationDeleted = options.onAnnotationDeleted;
-      this.eventTarget = options.eventTarget; // Optional element for dispatching events
+      this.eventTarget = options.eventTarget;
+
+      // Determine store: explicit > REST URL > memory
+      if (options.store) {
+        this.store = options.store;
+      } else if (options.annotationsUrl) {
+        this.store = new RestAnnotationStore({ baseUrl: options.annotationsUrl });
+      } else {
+        this.store = new MemoryAnnotationStore();
+      }
 
       this.annotations = new Map(); // id -> annotation
       this.annotationsByPage = new Map(); // pageNumber -> [annotations]
@@ -1311,15 +1587,8 @@
 
     async loadAnnotations() {
       try {
-        const request = new request_js.FetchRequest("get", `${this.annotationsUrl}.json`);
-        const response = await request.perform();
-
-        if (response.ok) {
-          const data = await response.json;
-          this._processAnnotations(data);
-        } else {
-          throw new Error("Server returned an error")
-        }
+        const annotations = await this.store.load();
+        this._processAnnotations(annotations);
       } catch (error) {
         console.error("Failed to load annotations:", error);
         this._dispatchError(AnnotationErrorType.LOAD_FAILED, "Failed to load annotations", error);
@@ -1355,26 +1624,14 @@
 
     async createAnnotation(data) {
       try {
-        const request = new request_js.FetchRequest("post", this.annotationsUrl, {
-          body: JSON.stringify({ annotation: data }),
-          contentType: "application/json",
-          responseKind: "json"
-        });
+        const annotation = await this.store.create(data);
+        this._addAnnotation(annotation);
 
-        const response = await request.perform();
-
-        if (response.ok) {
-          const annotation = await response.json;
-          this._addAnnotation(annotation);
-
-          if (this.onAnnotationCreated) {
-            this.onAnnotationCreated(annotation);
-          }
-
-          return annotation
-        } else {
-          throw new Error("Failed to create annotation")
+        if (this.onAnnotationCreated) {
+          this.onAnnotationCreated(annotation);
         }
+
+        return annotation
       } catch (error) {
         console.error("Failed to create annotation:", error);
         this._dispatchError(AnnotationErrorType.CREATE_FAILED, "Failed to save annotation", error);
@@ -1384,26 +1641,14 @@
 
     async updateAnnotation(id, data) {
       try {
-        const request = new request_js.FetchRequest("patch", `${this.annotationsUrl}/${id}`, {
-          body: JSON.stringify({ annotation: data }),
-          contentType: "application/json",
-          responseKind: "json"
-        });
+        const annotation = await this.store.update(id, data);
+        this._updateAnnotation(annotation);
 
-        const response = await request.perform();
-
-        if (response.ok) {
-          const annotation = await response.json;
-          this._updateAnnotation(annotation);
-
-          if (this.onAnnotationUpdated) {
-            this.onAnnotationUpdated(annotation);
-          }
-
-          return annotation
-        } else {
-          throw new Error("Failed to update annotation")
+        if (this.onAnnotationUpdated) {
+          this.onAnnotationUpdated(annotation);
         }
+
+        return annotation
       } catch (error) {
         console.error("Failed to update annotation:", error);
         this._dispatchError(AnnotationErrorType.UPDATE_FAILED, "Failed to update annotation", error);
@@ -1412,26 +1657,18 @@
     }
 
     async deleteAnnotation(id) {
+      const existingAnnotation = this.annotations.get(id);
+      if (!existingAnnotation) return
+
       try {
-        const annotation = this.annotations.get(id);
-        if (!annotation) return
+        const annotation = await this.store.delete(id);
+        this._removeAnnotation(id);
 
-        const request = new request_js.FetchRequest("delete", `${this.annotationsUrl}/${id}`, {
-          responseKind: "json"
-        });
-        const response = await request.perform();
-
-        if (response.ok) {
-          this._removeAnnotation(id);
-
-          if (this.onAnnotationDeleted) {
-            this.onAnnotationDeleted(annotation);
-          }
-
-          return annotation
-        } else {
-          throw new Error("Failed to delete annotation")
+        if (this.onAnnotationDeleted) {
+          this.onAnnotationDeleted(existingAnnotation);
         }
+
+        return existingAnnotation
       } catch (error) {
         console.error("Failed to delete annotation:", error);
         this._dispatchError(AnnotationErrorType.DELETE_FAILED, "Failed to delete annotation", error);
@@ -1441,23 +1678,16 @@
 
     async restoreAnnotation(id) {
       try {
-        const request = new request_js.FetchRequest("patch", `${this.annotationsUrl}/${id}/restore`, {
-          responseKind: "json"
-        });
-        const response = await request.perform();
+        const annotation = await this.store.restore(id);
+        if (!annotation) return null
 
-        if (response.ok) {
-          const annotation = await response.json;
-          this._addAnnotation(annotation);
+        this._addAnnotation(annotation);
 
-          if (this.onAnnotationCreated) {
-            this.onAnnotationCreated(annotation);
-          }
-
-          return annotation
-        } else {
-          throw new Error("Failed to restore annotation")
+        if (this.onAnnotationCreated) {
+          this.onAnnotationCreated(annotation);
         }
+
+        return annotation
       } catch (error) {
         console.error("Failed to restore annotation:", error);
         this._dispatchError(AnnotationErrorType.RESTORE_FAILED, "Failed to restore annotation", error);
@@ -2130,6 +2360,11 @@
     <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
   </svg>`,
 
+    // Comment/Speech bubble icon - used in annotation edit toolbar
+    comment: `<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+  </svg>`,
+
     // Chevron down - used in color pickers, dropdowns
     chevronDown: `<svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
     <polyline points="6 9 12 15 18 9"/>
@@ -2264,6 +2499,7 @@
       this.onColorChange = options.onColorChange;
       this.onDelete = options.onDelete;
       this.onEdit = options.onEdit;
+      this.onComment = options.onComment;
       this.onDeselect = options.onDeselect;
       this.colors = options.colors || ColorPicker.COLORS.map(c => c.value);
 
@@ -2280,6 +2516,9 @@
       this.element.className = "annotation-edit-toolbar hidden";
       this.element.innerHTML = `
       <div class="toolbar-buttons">
+        <button class="toolbar-btn comment-btn hidden" title="Add Comment (C)">
+          ${Icons.comment}
+        </button>
         <button class="color-picker-btn" title="Change color" aria-haspopup="true" aria-expanded="false">
           <span class="color-swatch"></span>
           ${Icons.chevronDown}
@@ -2299,11 +2538,12 @@
           ${Icons.delete}
         </button>
       </div>
-      <div class="toolbar-note-content hidden"></div>
+      <div class="toolbar-annotation-content hidden"></div>
     `;
 
+      this.commentBtn = this.element.querySelector(".comment-btn");
       this.editBtn = this.element.querySelector(".edit-btn");
-      this.noteContent = this.element.querySelector(".toolbar-note-content");
+      this.annotationContent = this.element.querySelector(".toolbar-annotation-content");
     }
 
     _setupEventListeners() {
@@ -2324,7 +2564,15 @@
         });
       });
 
-      // Edit button
+      // Comment button (for highlight/underline/ink annotations)
+      this.commentBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (this.currentAnnotation && this.onComment) {
+          this.onComment(this.currentAnnotation);
+        }
+      });
+
+      // Edit button (for notes)
       this.editBtn.addEventListener("click", (e) => {
         e.stopPropagation();
         if (this.currentAnnotation && this.onEdit) {
@@ -2376,6 +2624,13 @@
           if (this.currentAnnotation?.annotation_type === "note" && this.onEdit) {
             e.preventDefault();
             this.onEdit(this.currentAnnotation);
+          }
+        } else if (e.key === "c" || e.key === "C") {
+          // Comment shortcut for highlight/underline/ink annotations
+          const supportsComment = ["highlight", "line", "ink"].includes(this.currentAnnotation?.annotation_type);
+          if (supportsComment && this.onComment) {
+            e.preventDefault();
+            this.onComment(this.currentAnnotation);
           }
         }
       });
@@ -2432,15 +2687,26 @@
       const color = annotation.color || ColorPicker.DEFAULT_HIGHLIGHT_COLOR;
       this._updateSelectedColor(color);
 
-      // Show/hide edit button and note content based on annotation type
+      // Show/hide buttons based on annotation type
       const isNote = annotation.annotation_type === "note";
+      const supportsComment = ["highlight", "line", "ink"].includes(annotation.annotation_type);
+
+      // Comment button for highlight/underline/ink, edit button for notes
+      this.commentBtn.classList.toggle("hidden", !supportsComment);
       this.editBtn.classList.toggle("hidden", !isNote);
 
-      if (isNote && annotation.contents) {
-        this.noteContent.textContent = annotation.contents;
-        this.noteContent.classList.remove("hidden");
+      // Update comment button title based on whether contents exists
+      if (supportsComment) {
+        const hasComment = annotation.contents && annotation.contents.trim();
+        this.commentBtn.title = hasComment ? "Edit Comment (C)" : "Add Comment (C)";
+      }
+
+      // Show contents for any annotation type that has it
+      if (annotation.contents) {
+        this.annotationContent.textContent = annotation.contents;
+        this.annotationContent.classList.remove("hidden");
       } else {
-        this.noteContent.classList.add("hidden");
+        this.annotationContent.classList.add("hidden");
       }
 
       // Determine if toolbar should flip above the annotation
@@ -2461,9 +2727,9 @@
       this.element.classList.add("hidden");
       this.currentAnnotation = null;
 
-      // Clear note content
-      this.noteContent.textContent = "";
-      this.noteContent.classList.add("hidden");
+      // Clear annotation content
+      this.annotationContent.textContent = "";
+      this.annotationContent.classList.add("hidden");
 
       // Remove from parent when hidden
       if (this.element.parentNode) {
@@ -3157,10 +3423,10 @@
   };
 
   class AnnotationSidebar {
-    constructor({ container, annotationManager, onAnnotationClick }) {
-      this.container = container;
+    constructor({ element, itemTemplate, container, annotationManager, onAnnotationClick }) {
       this.annotationManager = annotationManager;
       this.onAnnotationClick = onAnnotationClick;
+      this.itemTemplate = itemTemplate;  // Optional <template> element for custom list items
 
       this.isOpen = false;
       this.sidebarWidth = SIDEBAR_DEFAULT_WIDTH;
@@ -3168,7 +3434,30 @@
       this.filterType = FilterType.ALL;
       this.selectedAnnotationId = null;
 
-      this._createElements();
+      if (element) {
+        // User provided HTML - find elements via data attributes
+        this.element = element;
+        this.container = element.parentElement;
+        this.listContainer = element.querySelector('[data-role="list"]');
+        this.header = element.querySelector('.pdf-sidebar-header');
+        this.emptyState = element.querySelector('[data-role="empty-state"]');
+        this.sortControls = element.querySelector('[data-role="sort-controls"]');
+        this.filterControls = element.querySelector('[data-role="filter-controls"]');
+        this.resizer = element.querySelector('[data-role="resizer"]');
+
+        // Read initial width from CSS variable if set
+        const currentWidth = element.style.getPropertyValue('--sidebar-width');
+        if (currentWidth) {
+          this.sidebarWidth = parseInt(currentWidth, 10) || SIDEBAR_DEFAULT_WIDTH;
+        } else {
+          element.style.setProperty('--sidebar-width', `${this.sidebarWidth}px`);
+        }
+      } else {
+        // Fallback - create default HTML (existing behavior)
+        this.container = container;
+        this._createElements();
+      }
+
       this._setupEventListeners();
     }
 
@@ -3251,27 +3540,35 @@
     }
 
     _setupEventListeners() {
-      // Close button
-      const closeBtn = this.header.querySelector(".pdf-sidebar-close");
-      closeBtn.addEventListener("click", () => this.close());
+      // Close button - support both user HTML (data-action="close") and auto-generated (.pdf-sidebar-close)
+      const closeBtn = this.header?.querySelector('[data-action="close"]') ||
+                       this.header?.querySelector(".pdf-sidebar-close");
+      if (closeBtn) {
+        closeBtn.addEventListener("click", () => this.close());
+      }
 
       // Sort buttons
-      this.sortControls.addEventListener("click", (e) => {
-        const btn = e.target.closest(".sort-btn");
-        if (btn) {
-          this.sortMode = btn.dataset.sort;
-          this.sortControls.querySelectorAll(".sort-btn").forEach(b => b.classList.remove("active"));
-          btn.classList.add("active");
-          this._refreshList();
-        }
-      });
+      if (this.sortControls) {
+        this.sortControls.addEventListener("click", (e) => {
+          const btn = e.target.closest("[data-sort]") || e.target.closest(".sort-btn");
+          if (btn && btn.dataset.sort) {
+            this.sortMode = btn.dataset.sort;
+            this.sortControls.querySelectorAll("[data-sort], .sort-btn").forEach(b => b.classList.remove("active"));
+            btn.classList.add("active");
+            this._refreshList();
+          }
+        });
+      }
 
-      // Filter select
-      const filterSelect = this.filterControls.querySelector(".annotation-filter-select");
-      filterSelect.addEventListener("change", (e) => {
-        this.filterType = e.target.value;
-        this._refreshList();
-      });
+      // Filter select - support both user HTML (data-action="filter") and auto-generated (.annotation-filter-select)
+      const filterSelect = this.filterControls?.querySelector('[data-action="filter"]') ||
+                           this.filterControls?.querySelector(".annotation-filter-select");
+      if (filterSelect) {
+        filterSelect.addEventListener("change", (e) => {
+          this.filterType = e.target.value;
+          this._refreshList();
+        });
+      }
 
       // Sidebar resizing
       this._setupResizer();
@@ -3283,6 +3580,8 @@
     }
 
     _setupResizer() {
+      if (!this.resizer) return
+
       let startX, startWidth;
 
       const onMouseMove = (e) => {
@@ -3366,16 +3665,19 @@
       // Clear and rebuild list
       this.listContainer.innerHTML = "";
 
-      // Update count badge
-      const countBadge = this.header.querySelector(".annotation-count-badge");
-      countBadge.textContent = annotations.length;
+      // Update count badge - support both user HTML (data-role="count") and auto-generated
+      const countBadge = this.header?.querySelector('[data-role="count"]') ||
+                         this.header?.querySelector(".annotation-count-badge");
+      if (countBadge) {
+        countBadge.textContent = annotations.length;
+      }
 
       // Show empty state or list
       if (annotations.length === 0) {
-        this.emptyState.classList.add("visible");
+        this.emptyState?.classList.add("visible");
         this.listContainer.classList.add("empty");
       } else {
-        this.emptyState.classList.remove("visible");
+        this.emptyState?.classList.remove("visible");
         this.listContainer.classList.remove("empty");
 
         for (const annotation of annotations) {
@@ -3444,40 +3746,71 @@
     }
 
     _createListItem(annotation) {
-      const item = document.createElement("div");
-      item.className = "annotation-list-item";
-      item.dataset.annotationId = annotation.id;
-      item.tabIndex = 0;
+      let item;
 
+      if (this.itemTemplate) {
+        // Clone user's template and populate data-field elements
+        item = this.itemTemplate.content.firstElementChild.cloneNode(true);
+        item.dataset.annotationId = annotation.id;
+
+        // Ensure tabIndex for keyboard navigation
+        if (!item.hasAttribute("tabindex")) {
+          item.tabIndex = 0;
+        }
+
+        // Determine display values
+        const { icon, label, typeLabel } = this._getAnnotationDisplay(annotation);
+        const timestamp = this._formatTimestamp(annotation.created_at);
+
+        // Populate data-field elements
+        this._setField(item, "icon", icon, annotation.color);
+        this._setField(item, "label", this._escapeHtml(label));
+        this._setField(item, "type", typeLabel);
+        this._setField(item, "page", `Page ${annotation.page}`);
+        this._setField(item, "time", timestamp);
+
+        // Also set data attributes for user's Stimulus controllers
+        item.dataset.annotationType = annotation.annotation_type;
+        item.dataset.annotationPage = annotation.page;
+        item.dataset.annotationColor = annotation.color || "";
+      } else {
+        // Fallback - existing innerHTML approach
+        item = document.createElement("div");
+        item.className = "annotation-list-item";
+        item.dataset.annotationId = annotation.id;
+        item.tabIndex = 0;
+
+        // Determine icon and label based on type
+        const { icon, label, typeLabel } = this._getAnnotationDisplay(annotation);
+
+        // Format timestamp
+        const timestamp = this._formatTimestamp(annotation.created_at);
+
+        item.innerHTML = `
+        <div class="annotation-item-icon" style="color: ${annotation.color || '#666'}">
+          ${icon}
+        </div>
+        <div class="annotation-item-content">
+          <div class="annotation-item-label">${this._escapeHtml(label)}</div>
+          <div class="annotation-item-meta">
+            <span class="annotation-item-type">${typeLabel}</span>
+            <span class="annotation-item-separator">•</span>
+            <span class="annotation-item-page">Page ${annotation.page}</span>
+            <span class="annotation-item-separator">•</span>
+            <span class="annotation-item-time">${timestamp}</span>
+          </div>
+        </div>
+        <div class="annotation-item-hover">
+          <span>Jump</span>
+          ${Icons.chevronRight}
+        </div>
+      `;
+      }
+
+      // Selection state
       if (this.selectedAnnotationId === annotation.id) {
         item.classList.add("selected");
       }
-
-      // Determine icon and label based on type
-      const { icon, label, typeLabel } = this._getAnnotationDisplay(annotation);
-
-      // Format timestamp
-      const timestamp = this._formatTimestamp(annotation.created_at);
-
-      item.innerHTML = `
-      <div class="annotation-item-icon" style="color: ${annotation.color || '#666'}">
-        ${icon}
-      </div>
-      <div class="annotation-item-content">
-        <div class="annotation-item-label">${this._escapeHtml(label)}</div>
-        <div class="annotation-item-meta">
-          <span class="annotation-item-type">${typeLabel}</span>
-          <span class="annotation-item-separator">•</span>
-          <span class="annotation-item-page">Page ${annotation.page}</span>
-          <span class="annotation-item-separator">•</span>
-          <span class="annotation-item-time">${timestamp}</span>
-        </div>
-      </div>
-      <div class="annotation-item-hover">
-        <span>Jump</span>
-        ${Icons.chevronRight}
-      </div>
-    `;
 
       // Click handler
       item.addEventListener("click", () => {
@@ -3488,6 +3821,23 @@
       });
 
       return item
+    }
+
+    /**
+     * Set a field value in a template-cloned element
+     * @param {HTMLElement} element - The cloned template element
+     * @param {string} fieldName - The data-field name to find
+     * @param {string} value - The value to set (can include HTML for icons)
+     * @param {string} color - Optional color to apply
+     */
+    _setField(element, fieldName, value, color) {
+      const field = element.querySelector(`[data-field="${fieldName}"]`);
+      if (field) {
+        field.innerHTML = value;
+        if (color && fieldName === "icon") {
+          field.style.color = color;
+        }
+      }
     }
 
     _getAnnotationDisplay(annotation) {
@@ -4864,15 +5214,25 @@
           for (let i = 0; i < result.length; i++) {
             const existing = result[i];
 
-            // Check if rects overlap (share vertical AND horizontal space)
-            const verticalOverlap = rect.top < existing.bottom && rect.bottom > existing.top;
+            // Calculate vertical overlap amount
+            const overlapTop = Math.max(rect.top, existing.top);
+            const overlapBottom = Math.min(rect.bottom, existing.bottom);
+            const overlapHeight = Math.max(0, overlapBottom - overlapTop);
+
+            // Require significant vertical overlap (at least 50% of smaller rect's height)
+            // This prevents merging rects from different lines that only slightly overlap
+            const rectHeight = rect.bottom - rect.top;
+            const existingHeight = existing.bottom - existing.top;
+            const minHeight = Math.min(rectHeight, existingHeight);
+            const significantVerticalOverlap = overlapHeight > minHeight * 0.5;
+
             const horizontalOverlap = rect.left < existing.right && rect.right > existing.left;
 
             // Also merge if they're adjacent horizontally on same line
             const sameLine = Math.abs(rect.top - existing.top) < 3 && Math.abs(rect.bottom - existing.bottom) < 3;
             const horizontallyAdjacent = Math.abs(rect.left - existing.right) < 2 || Math.abs(existing.left - rect.right) < 2;
 
-            if ((verticalOverlap && horizontalOverlap) || (sameLine && horizontallyAdjacent)) {
+            if ((significantVerticalOverlap && horizontalOverlap) || (sameLine && horizontallyAdjacent)) {
               // Merge: extend existing rect to encompass both
               result[i] = {
                 left: Math.min(existing.left, rect.left),
@@ -5837,12 +6197,12 @@
       });
     }
 
-    // Method to edit an existing note
+    // Method to edit an existing note or add/edit a comment on other annotation types
     editNote(annotation) {
       // Store currently focused element for restoration on close
       this._previousFocusElement = document.activeElement;
 
-      // Get the position of the note on screen
+      // Get the position of the annotation on screen
       const pageContainer = this.viewer.getPageContainer(annotation.page);
       if (!pageContainer) return
 
@@ -5854,10 +6214,20 @@
       // Store the annotation being edited
       this.editingAnnotation = annotation;
 
-      this._showEditDialog(rect.left + x, rect.top + y, annotation.contents);
+      // Determine dialog title based on annotation type and whether contents exists
+      const isNote = annotation.annotation_type === "note";
+      const hasContents = annotation.contents && annotation.contents.trim();
+      let dialogTitle;
+      if (isNote) {
+        dialogTitle = "Edit Note";
+      } else {
+        dialogTitle = hasContents ? "Edit Comment" : "Add Comment";
+      }
+
+      this._showEditDialog(rect.left + x, rect.top + y, annotation.contents, dialogTitle);
     }
 
-    _showEditDialog(x, y, existingText) {
+    _showEditDialog(x, y, existingText, title = "Edit Note") {
       // Remove any existing dialog (but keep editingAnnotation)
       this._removeDialog();
 
@@ -5866,7 +6236,7 @@
       this.noteDialog.className = "note-dialog";
       this.noteDialog.innerHTML = `
       <div class="note-dialog-header">
-        <span>Edit Note</span>
+        <span>${title}</span>
         <button class="note-dialog-close" aria-label="Close">
           ${Icons.close}
         </button>
@@ -6348,7 +6718,9 @@
       this._setupViewerEvents();
 
       // Annotation manager for CRUD operations
+      // Accepts custom store, falls back to REST store if URL provided, else memory store
       this.annotationManager = new AnnotationManager({
+        store: this.options.annotationStore,
         annotationsUrl: this.annotationsUrl,
         documentId: this.documentId,
         eventTarget: this.container, // For dispatching error events
@@ -6374,6 +6746,7 @@
         onColorChange: this._onAnnotationColorChange.bind(this),
         onDelete: this._onAnnotationDelete.bind(this),
         onEdit: this._onAnnotationEdit.bind(this),
+        onComment: this._onAnnotationComment.bind(this),
         onDeselect: this._deselectAnnotation.bind(this)
       });
 
@@ -6394,9 +6767,14 @@
           onPageClick: (pageNumber) => this.viewer.goToPage(pageNumber)
         });
 
-        // Annotation sidebar (inserted after pages container in the body)
+        // Annotation sidebar - check for user-defined element, fallback to auto-generated
+        const annotationSidebarEl = this.container.querySelector('[data-pdf-sidebar="annotations"]');
+        const annotationItemTemplate = this.container.querySelector('[data-pdf-template="annotation-item"]');
+
         this.annotationSidebar = new AnnotationSidebar({
-          container: this.bodyContainer,
+          element: annotationSidebarEl,           // null if not provided (triggers fallback)
+          itemTemplate: annotationItemTemplate,   // null if not provided (uses innerHTML)
+          container: this.bodyContainer,          // Used for fallback
           annotationManager: this.annotationManager,
           onAnnotationClick: (annotationId) => this._scrollToAnnotationWithFlash(annotationId)
         });
@@ -6558,7 +6936,7 @@
           await this.thumbnailSidebar.setDocument(this.viewer.pdfDocument);
         }
 
-        // Load existing annotations
+        // Load existing annotations from store
         await this.annotationManager.loadAnnotations();
 
         // Render annotations on all rendered pages
@@ -6773,6 +7151,14 @@
     _onAnnotationEdit(annotation) {
       // For notes, show the edit popup
       if (annotation.annotation_type === "note") {
+        this.tools[ToolMode.NOTE].editNote(annotation);
+      }
+    }
+
+    _onAnnotationComment(annotation) {
+      // For highlight/underline/ink, use the note tool's edit dialog to edit contents
+      const supportsComment = ["highlight", "line", "ink"].includes(annotation.annotation_type);
+      if (supportsComment) {
         this.tools[ToolMode.NOTE].editNote(annotation);
       }
     }
@@ -8179,11 +8565,14 @@
     }
   }
 
+  exports.AnnotationStore = AnnotationStore;
   exports.CoreViewer = CoreViewer;
+  exports.MemoryAnnotationStore = MemoryAnnotationStore;
   exports.PdfDownloadController = pdf_download_controller;
   exports.PdfSyncScrollController = pdf_sync_scroll_controller;
   exports.PdfViewer = PdfViewer;
   exports.PdfViewerController = pdf_viewer_controller;
+  exports.RestAnnotationStore = RestAnnotationStore;
   exports.ToolMode = ToolMode;
   exports.ViewerEvents = ViewerEvents;
 
