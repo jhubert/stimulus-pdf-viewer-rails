@@ -3665,6 +3665,17 @@ class AnnotationSidebar {
         this.listContainer.appendChild(item);
       }
     }
+
+    // Re-fire selected event after rebuild so consumers can re-attach detail panels
+    if (this.selectedAnnotationId) {
+      const annotation = this.annotationManager.getAnnotation(this.selectedAnnotationId);
+      if (annotation) {
+        this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-selected", {
+          bubbles: true,
+          detail: { annotationId: this.selectedAnnotationId, annotation }
+        }));
+      }
+    }
   }
 
   _matchesFilter(annotation) {
@@ -3887,10 +3898,22 @@ class AnnotationSidebar {
   }
 
   _selectItem(annotationId) {
+    const previousId = this.selectedAnnotationId;
+
+    // Skip if already selected
+    if (previousId === annotationId) return
+
     // Deselect previous
     const prev = this.listContainer.querySelector(".annotation-list-item.selected");
     if (prev) {
       prev.classList.remove("selected");
+    }
+
+    if (previousId) {
+      this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-deselected", {
+        bubbles: true,
+        detail: { annotationId: previousId }
+      }));
     }
 
     // Select new
@@ -3899,6 +3922,12 @@ class AnnotationSidebar {
     if (item) {
       item.classList.add("selected");
     }
+
+    const annotation = this.annotationManager.getAnnotation(annotationId);
+    this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-selected", {
+      bubbles: true,
+      detail: { annotationId, annotation }
+    }));
   }
 
   /**
@@ -3926,7 +3955,12 @@ class AnnotationSidebar {
     if (this.isOpen) {
       // Clear selection if deleted annotation was selected
       if (this.selectedAnnotationId === annotation.id) {
+        const previousId = this.selectedAnnotationId;
         this.selectedAnnotationId = null;
+        this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-deselected", {
+          bubbles: true,
+          detail: { annotationId: previousId }
+        }));
       }
       this._refreshList();
     }
@@ -3954,6 +3988,10 @@ class AnnotationSidebar {
     this.element.classList.add("open");
     this.container.classList.add("annotation-sidebar-open");
     this._refreshList();
+
+    this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-sidebar-opened", {
+      bubbles: true
+    }));
   }
 
   /**
@@ -3963,6 +4001,10 @@ class AnnotationSidebar {
     this.isOpen = false;
     this.element.classList.remove("open");
     this.container.classList.remove("annotation-sidebar-open");
+
+    this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-sidebar-closed", {
+      bubbles: true
+    }));
   }
 
   /**
@@ -6873,6 +6915,10 @@ class PdfViewer {
       if (e.target.closest(".annotation") || e.target.closest(".annotation-edit-toolbar")) {
         return
       }
+      // Skip if an annotation was just created (click follows pointerup from text selection)
+      if (this._suppressClickDeselect) {
+        return
+      }
       this._deselectAnnotation();
     });
 
@@ -6921,6 +6967,12 @@ class PdfViewer {
 
       // Render annotations on all rendered pages
       this._renderAnnotations();
+
+      const annotations = this.annotationManager.getAllAnnotations();
+      this.container.dispatchEvent(new CustomEvent("pdf-viewer:annotations-loaded", {
+        bubbles: true,
+        detail: { annotations, count: annotations.length }
+      }));
 
       // Navigate to initial page if specified
       if (this.initialPage > 1) {
@@ -7049,10 +7101,14 @@ class PdfViewer {
 
     // Auto-select the newly created annotation
     const pageContainer = this.viewer.getPageContainer(annotation.page);
-    const element = pageContainer?.querySelector(`[data-annotation-id="${annotation.id}"]`);
+    const element = pageContainer?.querySelector(`.annotation[data-annotation-id="${annotation.id}"]`);
     if (element) {
       this._selectAnnotation(annotation, element);
     }
+
+    // Suppress the click-to-deselect that follows pointerup after text selection
+    this._suppressClickDeselect = true;
+    setTimeout(() => { this._suppressClickDeselect = false; }, 100);
 
     // Notify annotation sidebar
     this.annotationSidebar?.onAnnotationCreated(annotation);
@@ -7081,7 +7137,7 @@ class PdfViewer {
     // Re-select the annotation after re-render
     if (wasSelected) {
       const pageContainer = this.viewer.getPageContainer(annotation.page);
-      const element = pageContainer?.querySelector(`[data-annotation-id="${annotation.id}"]`);
+      const element = pageContainer?.querySelector(`.annotation[data-annotation-id="${annotation.id}"]`);
       if (element) {
         // Get the fresh annotation data from the manager
         const updatedAnnotation = this.annotationManager.getAnnotation(annotation.id);
@@ -7102,6 +7158,11 @@ class PdfViewer {
     // Announce to screen readers
     const typeLabel = this._getAnnotationTypeLabel(annotation.annotation_type);
     getAnnouncer().announce(`${typeLabel} updated`);
+
+    this.container.dispatchEvent(new CustomEvent("pdf-viewer:annotation-updated", {
+      bubbles: true,
+      detail: { annotation }
+    }));
   }
 
   _onAnnotationDeleted(annotation) {
@@ -7756,6 +7817,8 @@ class PdfViewer {
   }
 
   _deselectAnnotation() {
+    const previousAnnotation = this.selectedAnnotation;
+
     if (this.selectedAnnotationElement) {
       this.selectedAnnotationElement.classList.remove("selected");
     }
@@ -7764,6 +7827,13 @@ class PdfViewer {
 
     // Hide the edit toolbar
     this.annotationEditToolbar.hide();
+
+    if (previousAnnotation) {
+      this.container.dispatchEvent(new CustomEvent("pdf-viewer:annotation-deselected", {
+        bubbles: true,
+        detail: { annotationId: previousAnnotation.id }
+      }));
+    }
   }
 
   async _onAnnotationColorChange(annotation, color) {
