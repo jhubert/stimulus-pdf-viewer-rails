@@ -415,40 +415,87 @@
 
     /**
      * Load a PDF document from a URL.
+     *
+     * PDF.js loads PDFs via streamed HTTP Range requests by default, which some
+     * corporate antivirus / web-filter products block while letting plain GETs
+     * through. If the initial streamed load fails with a network-shaped error,
+     * we retry once by fetching the entire PDF as an ArrayBuffer and handing the
+     * bytes to PDF.js directly.
+     *
      * @param {string} url - The PDF URL
      * @returns {Promise<PDFDocumentProxy>}
      */
     async load(url) {
       try {
-        const loadingTask = pdfjsLib__namespace.getDocument(url);
-        this.pdfDocument = await loadingTask.promise;
-        this.pageCount = this.pdfDocument.numPages;
-
-        // Clear any existing content
-        this.container.innerHTML = "";
-        this.pages.clear();
-
-        // Set initial display scale on container
-        this.container.style.setProperty("--display-scale", String(this.displayScale));
-
-        // Create page placeholders for all pages
-        await this._createPagePlaceholders();
-
-        // Dispatch loaded event
-        this.eventBus.dispatch(ViewerEvents.DOCUMENT_LOADED, {
-          pageCount: this.pageCount,
-          pdfDocument: this.pdfDocument
-        });
-
-        // Trigger initial render of visible pages
-        this._renderingQueue.renderHighestPriority(this.getVisiblePages());
-
-        return this.pdfDocument
+        return await this._loadDocument(url)
       } catch (error) {
+        if (typeof url === "string" && this._shouldRetryAsBlob(error)) {
+          console.warn("PDF streamed load failed, retrying as full fetch:", error);
+          try {
+            const response = await fetch(url, { credentials: "same-origin" });
+            if (!response.ok) {
+              throw new Error(`HTTP ${response.status} fetching PDF`)
+            }
+            const data = new Uint8Array(await response.arrayBuffer());
+            return await this._loadDocument({ data })
+          } catch (retryError) {
+            console.error("PDF blob fallback also failed:", retryError);
+            this.eventBus.dispatch(ViewerEvents.DOCUMENT_LOAD_ERROR, { error: retryError });
+            throw retryError
+          }
+        }
         console.error("Error loading PDF:", error);
         this.eventBus.dispatch(ViewerEvents.DOCUMENT_LOAD_ERROR, { error });
         throw error
       }
+    }
+
+    /**
+     * Load a PDF document from either a URL or pre-fetched bytes.
+     * @param {string|{data: Uint8Array}} source
+     * @returns {Promise<PDFDocumentProxy>}
+     */
+    async _loadDocument(source) {
+      const loadingTask = pdfjsLib__namespace.getDocument(source);
+      this.pdfDocument = await loadingTask.promise;
+      this.pageCount = this.pdfDocument.numPages;
+
+      // Clear any existing content
+      this.container.innerHTML = "";
+      this.pages.clear();
+
+      // Set initial display scale on container
+      this.container.style.setProperty("--display-scale", String(this.displayScale));
+
+      // Create page placeholders for all pages
+      await this._createPagePlaceholders();
+
+      // Dispatch loaded event
+      this.eventBus.dispatch(ViewerEvents.DOCUMENT_LOADED, {
+        pageCount: this.pageCount,
+        pdfDocument: this.pdfDocument
+      });
+
+      // Trigger initial render of visible pages
+      this._renderingQueue.renderHighestPriority(this.getVisiblePages());
+
+      return this.pdfDocument
+    }
+
+    /**
+     * Decide whether a load failure is worth retrying via full-fetch.
+     * Skips errors where a different transport won't help: password-protected
+     * PDFs, corrupt files, and auth failures.
+     */
+    _shouldRetryAsBlob(error) {
+      const message = String(error?.message || error || "");
+      const name = String(error?.name || "");
+
+      if (/Password|InvalidPDF/i.test(name)) return false
+      if (/\b40[0-9]\b/.test(message)) return false
+      if (/password|invalid pdf|encrypted/i.test(message)) return false
+
+      return true
     }
 
     /**
@@ -2455,11 +2502,12 @@
       });
 
       // Close on outside click
-      document.addEventListener("click", () => {
+      this._documentClickHandler = () => {
         if (this.isOpen) {
           this._closeDropdown();
         }
-      });
+      };
+      document.addEventListener("click", this._documentClickHandler);
     }
 
     _closeDropdown() {
@@ -2491,6 +2539,15 @@
 
     getColor() {
       return this.currentColor
+    }
+
+    destroy() {
+      if (this._documentClickHandler) {
+        document.removeEventListener("click", this._documentClickHandler);
+        this._documentClickHandler = null;
+      }
+      this.element?.remove();
+      this.element = null;
     }
   }
 
@@ -8408,6 +8465,7 @@
       this.annotationSidebar?.destroy();
       this.findController?.destroy();
       this.findBar?.destroy();
+      this.colorPicker?.destroy();
 
       Object.values(this.tools).forEach(tool => tool.destroy?.());
 
@@ -8430,7 +8488,8 @@
       initialPage: Number,
       initialAnnotation: String,
       autoHeight: { type: Boolean, default: true },
-      detailPanel: { type: Boolean, default: false }
+      detailPanel: { type: Boolean, default: false },
+      errorMessage: String
     }
 
     initialize() {
@@ -8466,8 +8525,25 @@
         await this.pdfViewer.load();
       } catch (error) {
         console.error("Failed to load PDF:", error);
-        this._showError("Failed to load PDF document");
+        this._handleLoadFailure(error);
       }
+    }
+
+    // Surface a final load failure: hide the spinner, show a host-customizable
+    // message, and dispatch a DOM event so the host app can wire telemetry.
+    _handleLoadFailure(error) {
+      if (this.hasLoadingOverlayTarget) {
+        this.loadingOverlayTarget.classList.add("hidden");
+      }
+      const message = this.errorMessageValue || "Failed to load PDF document";
+      this._showError(message);
+      this.containerTarget.dispatchEvent(new CustomEvent("pdf-viewer:load-failed", {
+        bubbles: true,
+        detail: {
+          message: String(error?.message || error || ""),
+          name: String(error?.name || "")
+        }
+      }));
     }
 
     _setupErrorListener() {

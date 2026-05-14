@@ -2,6 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-05-13
+
+### Added
+- Updated stimulus-pdf-viewer to 0.3.2
+
 ## [0.3.0] - 2026-04-01
 
 ### Added
