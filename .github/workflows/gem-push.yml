@@ -18,6 +18,11 @@ jobs:
       uses: ruby/setup-ruby@v1
       with:
         ruby-version: '3.2'
+        # Gemfile.lock is gitignored for this gem, so setup-ruby would otherwise
+        # fall back to Ruby 3.2's built-in Bundler 2.4.19, which can't load the
+        # securerandom default gem at the resolved version and fails
+        # `bundle exec rake release`. Pin a modern bundler that handles it.
+        bundler: '2.5.23'
         bundler-cache: true
 
     - name: Publish to RubyGems
