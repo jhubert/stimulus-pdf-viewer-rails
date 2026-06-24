@@ -52,8 +52,14 @@
           console.error("EventBus.on: signal is already aborted");
           return
         }
-        rmAbort = () => this.off(eventName, listener);
-        signal.addEventListener("abort", rmAbort);
+        // Two distinct functions: onAbort removes the listener when the signal
+        // fires; rmAbort detaches onAbort from the signal when the listener is
+        // removed via off(). They must NOT be the same function — if rmAbort
+        // called off(), off()'s own rmAbort?.() invocation would re-enter off()
+        // for the still-present listener and recurse until the stack overflows.
+        const onAbort = () => this.off(eventName, listener);
+        rmAbort = () => signal.removeEventListener("abort", onAbort);
+        signal.addEventListener("abort", onAbort);
       }
 
       const eventListeners = (this._listeners[eventName] ||= []);
@@ -344,6 +350,16 @@
   const workerSrcMeta = document.querySelector('meta[name="pdf-worker-src"]');
   pdfjsLib__namespace.GlobalWorkerOptions.workerSrc = workerSrcMeta?.content || "/assets/pdfjs-dist--pdf.worker.js";
 
+  // Browser canvas limits. Most engines cap a canvas at 16384px per side and a
+  // total backing-store area; exceeding either silently produces a blank canvas.
+  // Large-format pages or high zoom on retina displays can blow past these.
+  const MAX_CANVAS_DIM = 16384;
+  const MAX_CANVAS_PIXELS = 16_777_216; // ~16.7M px, conservative for Safari/iOS
+
+  // How many pages on each side of the visible range to measure ahead of time.
+  // Larger than the rendering queue's pre-render range because measuring is cheap.
+  const MEASURE_BUFFER = 5;
+
   /**
    * Scale values that can be used with setScale()
    */
@@ -375,10 +391,14 @@
 
       // PDF.js document reference
       this.pdfDocument = null;
+      this._loadingTask = null;
       this.pageCount = 0;
 
       // Page data storage: pageNumber -> PageData
       this.pages = new Map();
+
+      // Pages with an in-flight dimension measurement (dedup for _measurePage)
+      this._measuringPages = new Set();
 
       // Device pixel ratio for high-DPI displays
       this.devicePixelRatio = window.devicePixelRatio || 1;
@@ -397,9 +417,17 @@
       this._renderingQueue = new RenderingQueue();
       this._renderingQueue.setViewer(this);
 
+      // Single AbortController for every DOM/document/window listener this viewer
+      // adds, so destroy() can remove them all at once. Several of these live on
+      // the global document/window and would otherwise outlive the viewer,
+      // pinning it (and its PDF document) in memory on every reconnect.
+      this._abortController = new AbortController();
+
       // Scroll handling
       this._scrollHandler = this._onScroll.bind(this);
-      this.container.addEventListener("scroll", this._scrollHandler);
+      this.container.addEventListener("scroll", this._scrollHandler, {
+        signal: this._abortController.signal
+      });
 
       // Resize handling
       this._resizeObserver = new ResizeObserver(() => this._onResize());
@@ -456,13 +484,15 @@
      * @returns {Promise<PDFDocumentProxy>}
      */
     async _loadDocument(source) {
-      const loadingTask = pdfjsLib__namespace.getDocument(source);
-      this.pdfDocument = await loadingTask.promise;
-      this.pageCount = this.pdfDocument.numPages;
+      // Release any previously-loaded document (and its in-flight loading task)
+      // before starting a new one, so reloading a different PDF — or the blob
+      // fallback retry in load() — doesn't orphan a whole PDF.js document and its
+      // worker-side resources.
+      await this._teardownDocument();
 
-      // Clear any existing content
-      this.container.innerHTML = "";
-      this.pages.clear();
+      this._loadingTask = pdfjsLib__namespace.getDocument(source);
+      this.pdfDocument = await this._loadingTask.promise;
+      this.pageCount = this.pdfDocument.numPages;
 
       // Set initial display scale on container
       this.container.style.setProperty("--display-scale", String(this.displayScale));
@@ -476,8 +506,10 @@
         pdfDocument: this.pdfDocument
       });
 
-      // Trigger initial render of visible pages
+      // Trigger initial render of visible pages, and measure the pages around
+      // them so their placeholders are correctly sized before being scrolled to.
       this._renderingQueue.renderHighestPriority(this.getVisiblePages());
+      this._measurePagesAround();
 
       return this.pdfDocument
     }
@@ -499,34 +531,73 @@
     }
 
     /**
+     * Total rotation to render a page at: the page's intrinsic /Rotate value
+     * combined with any user-applied viewer rotation.
+     *
+     * PDF.js treats the `rotation` option passed to getViewport() as absolute,
+     * so we must add page.rotate ourselves — otherwise pages that rely on
+     * /Rotate (e.g. landscape scans stored as portrait + /Rotate 90) render
+     * sideways.
+     * @param {Object} page - PDF.js page proxy
+     * @returns {number} rotation in degrees, normalized to 0-359
+     */
+    _rotationFor(page) {
+      return (((this.rotation + (page.rotate || 0)) % 360) + 360) % 360
+    }
+
+    /**
+     * Reduce the device-pixel multiplier so the canvas backing store stays within
+     * the browser's maximum side length and total area. Returns a scale <= the
+     * desired one (it can drop below 1 for very large pages, trading sharpness
+     * for a page that actually renders).
+     * @param {number} cssWidth - displayed width in CSS px
+     * @param {number} cssHeight - displayed height in CSS px
+     * @param {number} desiredScale - preferred multiplier (typically devicePixelRatio)
+     * @returns {number}
+     */
+    _clampOutputScale(cssWidth, cssHeight, desiredScale) {
+      const w = Math.max(1, cssWidth);
+      const h = Math.max(1, cssHeight);
+
+      let scale = Math.min(desiredScale, MAX_CANVAS_DIM / w, MAX_CANVAS_DIM / h);
+
+      const area = w * scale * h * scale;
+      if (area > MAX_CANVAS_PIXELS) {
+        scale *= Math.sqrt(MAX_CANVAS_PIXELS / area);
+      }
+
+      return scale
+    }
+
+    /**
      * Create placeholder containers for all pages with correct dimensions.
      * Pages are rendered lazily when they become visible.
      */
     async _createPagePlaceholders() {
-      // Get first page to determine default dimensions
+      // Page 1's size seeds every placeholder so the first paint and page-1
+      // render aren't blocked on measuring the whole document. Each page's true
+      // size is filled in lazily by _measurePagesAround() as it nears the
+      // viewport (see _onScroll), keeping with the streamed/lazy loading model.
       const firstPage = await this.pdfDocument.getPage(1);
-      const defaultViewport = firstPage.getViewport({ scale: 1.0, rotation: this.rotation });
+      const firstViewport = firstPage.getViewport({ scale: 1.0, rotation: this._rotationFor(firstPage) });
 
-      // Create all placeholders immediately with default dimensions
-      // Actual dimensions will be set when each page is rendered
       for (let pageNum = 1; pageNum <= this.pageCount; pageNum++) {
         const pageContainer = document.createElement("div");
         pageContainer.className = "pdf-page";
         pageContainer.dataset.pageNumber = pageNum;
 
-        // Use default dimensions (will be corrected when page renders)
-        pageContainer.style.setProperty("--page-width", `${defaultViewport.width}px`);
-        pageContainer.style.setProperty("--page-height", `${defaultViewport.height}px`);
+        // Provisional dimensions (corrected per-page below and again on render)
+        pageContainer.style.setProperty("--page-width", `${firstViewport.width}px`);
+        pageContainer.style.setProperty("--page-height", `${firstViewport.height}px`);
         pageContainer.style.setProperty("--display-scale", String(this.displayScale));
 
         this.container.appendChild(pageContainer);
 
         // Store page data with INITIAL rendering state
-        // page and unitViewport will be set when rendering
         this.pages.set(pageNum, {
           page: pageNum === 1 ? firstPage : null,
           container: pageContainer,
-          unitViewport: pageNum === 1 ? defaultViewport : null,
+          unitViewport: pageNum === 1 ? firstViewport : null,
           canvas: null,
           textLayer: null,
           renderingState: RenderingStates.INITIAL
@@ -536,6 +607,60 @@
       this.eventBus.dispatch(ViewerEvents.PAGES_LOADED, {
         pageCount: this.pageCount
       });
+    }
+
+    /**
+     * Measure pages near the viewport so their placeholders reserve the right
+     * amount of space before the user reaches them. Without this, unmeasured
+     * placeholders use page 1's size and a mixed-size/orientation document jumps
+     * as each page renders.
+     *
+     * Measuring is far cheaper than rendering (getPage + getViewport, no canvas),
+     * so we cover a wider window than the rendering queue's pre-render range while
+     * still staying lazy — we never measure the whole document up front, which
+     * matters for large/streamed PDFs.
+     * @returns {Promise<void>}
+     */
+    async _measurePagesAround() {
+      if (!this.pdfDocument) return
+
+      const { first, last } = this.getVisiblePages();
+      if (first === null) return
+
+      const from = Math.max(1, first - MEASURE_BUFFER);
+      const to = Math.min(this.pageCount, last + MEASURE_BUFFER);
+
+      for (let pageNum = from; pageNum <= to; pageNum++) {
+        await this._measurePage(pageNum);
+      }
+    }
+
+    /**
+     * Load and measure a single page, caching its size and page proxy. No-op if
+     * already measured or a measurement is already in flight for it.
+     * @param {number} pageNum
+     * @returns {Promise<void>}
+     */
+    async _measurePage(pageNum) {
+      const pageData = this.pages.get(pageNum);
+      if (!pageData || pageData.unitViewport || this._measuringPages.has(pageNum)) return
+
+      this._measuringPages.add(pageNum);
+      try {
+        const page = await this.pdfDocument.getPage(pageNum);
+        const viewport = page.getViewport({ scale: 1.0, rotation: this._rotationFor(page) });
+
+        // Reuse the loaded page and measured viewport when this page renders.
+        pageData.page = page;
+        pageData.unitViewport = viewport;
+        pageData.container.style.setProperty("--page-width", `${viewport.width}px`);
+        pageData.container.style.setProperty("--page-height", `${viewport.height}px`);
+      } catch (error) {
+        // Leave the provisional size in place if a page can't be measured.
+        console.warn(`Could not measure page ${pageNum}:`, error);
+      } finally {
+        this._measuringPages.delete(pageNum);
+      }
     }
 
     /**
@@ -570,7 +695,7 @@
 
         if (!page) {
           page = await this.pdfDocument.getPage(pageNumber);
-          unitViewport = page.getViewport({ scale: 1.0, rotation: this.rotation });
+          unitViewport = page.getViewport({ scale: 1.0, rotation: this._rotationFor(page) });
           pageData.page = page;
           pageData.unitViewport = unitViewport;
 
@@ -588,7 +713,7 @@
         const displayScale = this.displayScale;
 
         // Get viewport at display scale (what we want to show on screen)
-        const displayViewport = page.getViewport({ scale: displayScale, rotation: this.rotation });
+        const displayViewport = page.getViewport({ scale: displayScale, rotation: this._rotationFor(page) });
 
         // Create canvas for PDF rendering
         const canvas = document.createElement("canvas");
@@ -602,20 +727,29 @@
         // Canvas backing store = displayed size × devicePixelRatio (for retina crispness)
         const cssWidth = Math.round(displayViewport.width);
         const cssHeight = Math.round(displayViewport.height);
-        canvas.width = Math.floor(cssWidth * dpr);
-        canvas.height = Math.floor(cssHeight * dpr);
+
+        // Clamp the backing-store resolution to the browser's canvas limits.
+        // We scale down the device-pixel multiplier (not the displayed CSS size),
+        // so an oversized page degrades to slightly softer rendering instead of a
+        // blank canvas.
+        const outputScale = this._clampOutputScale(cssWidth, cssHeight, dpr);
+        canvas.width = Math.floor(cssWidth * outputScale);
+        canvas.height = Math.floor(cssHeight * outputScale);
 
         container.appendChild(canvas);
 
-        // Render PDF page at displayScale, with DPR transform for retina
+        // Render PDF page at displayScale, with outputScale transform for retina
         await page.render({
           canvasContext: context,
           viewport: displayViewport,
-          transform: [dpr, 0, 0, dpr, 0, 0] // Scale drawing for retina
+          transform: [outputScale, 0, 0, outputScale, 0, 0] // Scale drawing to backing store
         }).promise;
 
         // Create or update text layer
         if (pageData.textLayer) {
+          // Drop the stale entry so the selection map doesn't retain detached
+          // text-layer nodes across re-renders (zoom, reload).
+          this._textLayers.delete(pageData.textLayer);
           pageData.textLayer.remove();
         }
 
@@ -730,8 +864,10 @@
         direction: this._scrollDirection
       });
 
-      // Trigger rendering of visible pages
+      // Trigger rendering of visible pages, and measure the pages just ahead so
+      // their placeholders are sized before they scroll into view.
       this._renderingQueue.renderHighestPriority(this.getVisiblePages());
+      this._measurePagesAround();
     }
 
     /**
@@ -830,8 +966,10 @@
      * @returns {number}
      */
     _calculateScale(preset) {
-      const firstPage = this.pages.get(1);
-      if (!firstPage) return 1.0
+      // Fit presets are computed from the page the user is actually looking at,
+      // not always page 1 — documents often mix portrait and landscape pages.
+      const pageData = this.pages.get(this.getCurrentPage()) || this.pages.get(1);
+      if (!pageData || !pageData.unitViewport) return 1.0
 
       // Get computed padding from the container
       const computedStyle = window.getComputedStyle(this.container);
@@ -845,8 +983,8 @@
       const availableWidth = this.container.clientWidth - paddingLeft - paddingRight;
       const availableHeight = this.container.clientHeight - paddingTop - paddingBottom;
 
-      const pageWidth = firstPage.unitViewport.width;
-      const pageHeight = firstPage.unitViewport.height;
+      const pageWidth = pageData.unitViewport.width;
+      const pageHeight = pageData.unitViewport.height;
 
       switch (preset) {
         case ScaleValue.PAGE_WIDTH:
@@ -890,6 +1028,8 @@
         return Math.sqrt(dx * dx + dy * dy)
       };
 
+      const signal = this._abortController.signal;
+
       this.container.addEventListener("touchstart", (e) => {
         if (e.touches.length === 2) {
           isPinching = true;
@@ -898,7 +1038,7 @@
           // Prevent default to stop page scrolling during pinch
           e.preventDefault();
         }
-      }, { passive: false });
+      }, { passive: false, signal });
 
       this.container.addEventListener("touchmove", (e) => {
         if (!isPinching || e.touches.length !== 2) return
@@ -918,17 +1058,17 @@
         if (Math.abs(newScale - this.displayScale) > 0.01) {
           this.setScale(newScale);
         }
-      }, { passive: false });
+      }, { passive: false, signal });
 
       this.container.addEventListener("touchend", (e) => {
         if (e.touches.length < 2) {
           isPinching = false;
         }
-      });
+      }, { signal });
 
       this.container.addEventListener("touchcancel", () => {
         isPinching = false;
-      });
+      }, { signal });
     }
 
     // ===== Navigation Methods =====
@@ -1023,71 +1163,8 @@
       return this.pages.get(pageNumber)?.container
     }
 
-    getPageCanvas(pageNumber) {
-      return this.pages.get(pageNumber)?.canvas
-    }
-
     getTextLayer(pageNumber) {
       return this.pages.get(pageNumber)?.textLayer
-    }
-
-    getPageHeight(pageNumber) {
-      return this.pages.get(pageNumber)?.unitViewport?.height || 0
-    }
-
-    getPageWidth(pageNumber) {
-      return this.pages.get(pageNumber)?.unitViewport?.width || 0
-    }
-
-    /**
-     * Get page number from a DOM element within a page.
-     * @param {HTMLElement} element
-     * @returns {number|null}
-     */
-    getPageNumberFromElement(element) {
-      const pageContainer = element.closest(".pdf-page");
-      if (pageContainer) {
-        return parseInt(pageContainer.dataset.pageNumber, 10)
-      }
-      return null
-    }
-
-    // ===== Coordinate Transformation =====
-
-    /**
-     * Convert screen coordinates to PDF page coordinates (unscaled).
-     * @param {number} screenX
-     * @param {number} screenY
-     * @param {number} pageNumber
-     * @returns {Object|null} - { x, y } in PDF coordinates
-     */
-    screenToPdfCoords(screenX, screenY, pageNumber) {
-      const pageData = this.pages.get(pageNumber);
-      if (!pageData) return null
-
-      const rect = pageData.container.getBoundingClientRect();
-      const x = (screenX - rect.left) / this.displayScale;
-      const y = (screenY - rect.top) / this.displayScale;
-
-      return { x, y }
-    }
-
-    /**
-     * Convert PDF page coordinates to screen coordinates.
-     * @param {number} pdfX
-     * @param {number} pdfY
-     * @param {number} pageNumber
-     * @returns {Object|null} - { x, y } in screen coordinates
-     */
-    pdfToScreenCoords(pdfX, pdfY, pageNumber) {
-      const pageData = this.pages.get(pageNumber);
-      if (!pageData) return null
-
-      const rect = pageData.container.getBoundingClientRect();
-      const x = pdfX * this.displayScale + rect.left;
-      const y = pdfY * this.displayScale + rect.top;
-
-      return { x, y }
     }
 
     // ===== Text Layer Selection Handling =====
@@ -1105,14 +1182,16 @@
     _bindTextLayerSelection(textLayerDiv, endOfContent) {
       this._textLayers.set(textLayerDiv, endOfContent);
 
+      const signal = this._abortController.signal;
+
       textLayerDiv.addEventListener("mousedown", () => {
         textLayerDiv.classList.add("selecting");
-      });
+      }, { signal });
 
       // Touch events for iOS selection handling
       textLayerDiv.addEventListener("touchstart", () => {
         textLayerDiv.classList.add("selecting");
-      }, { passive: true });
+      }, { passive: true, signal });
     }
 
     /**
@@ -1196,25 +1275,27 @@
         }
       };
 
+      const signal = this._abortController.signal;
+
       document.addEventListener("pointerdown", () => {
         isPointerDown = true;
-      });
+      }, { signal });
 
       document.addEventListener("pointerup", () => {
         isPointerDown = false;
         clearSelection();
-      });
+      }, { signal });
 
       window.addEventListener("blur", () => {
         isPointerDown = false;
         clearSelection();
-      });
+      }, { signal });
 
       document.addEventListener("keyup", () => {
         if (!isPointerDown) {
           clearSelection();
         }
-      });
+      }, { signal });
 
       document.addEventListener("selectionchange", () => {
         // Early return if no text layers registered yet
@@ -1288,32 +1369,52 @@
         if (CoreViewer._isIOS) {
           this._updateIOSSelectionHighlights();
         }
-      });
+      }, { signal });
     }
 
     // ===== Cleanup =====
 
-    destroy() {
-      // Remove event listeners
-      this.container.removeEventListener("scroll", this._scrollHandler);
-      this._resizeObserver.disconnect();
-
-      // Clean up rendering queue
-      this._renderingQueue.destroy();
-
-      // Clean up PDF document
-      if (this.pdfDocument) {
-        this.pdfDocument.destroy();
-        this.pdfDocument = null;
+    /**
+     * Release the currently-loaded PDF document and all per-page resources.
+     * Used both when loading a replacement document and on destroy().
+     * @returns {Promise<void>}
+     */
+    async _teardownDocument() {
+      // Release page-level rendering resources before destroying the document.
+      for (const pageData of this.pages.values()) {
+        pageData.page?.cleanup?.();
+        pageData.canvas?.remove();
       }
-
-      // Clean up event bus
-      this.eventBus.destroy();
-
-      // Clear container
-      this.container.innerHTML = "";
       this.pages.clear();
       this._textLayers.clear();
+      this.container.innerHTML = "";
+
+      // Destroying the loading task tears down the document and its worker
+      // transport. Guarded because it may already be destroyed or still loading.
+      const loadingTask = this._loadingTask;
+      this._loadingTask = null;
+      this.pdfDocument = null;
+      if (loadingTask) {
+        try {
+          await loadingTask.destroy();
+        } catch (error) {
+          console.warn("Error destroying PDF loading task:", error);
+        }
+      }
+    }
+
+    destroy() {
+      // Remove every listener registered with the abort signal (scroll, pinch,
+      // per-text-layer, and the global document/window selection listeners).
+      this._abortController.abort();
+      this._resizeObserver.disconnect();
+
+      // Clean up rendering queue and event bus
+      this._renderingQueue.destroy();
+      this.eventBus.destroy();
+
+      // Release the PDF document and per-page resources (async; fire-and-forget).
+      this._teardownDocument();
     }
   }
 
@@ -2564,6 +2665,9 @@
       this.element = null;
       this.colorDropdownOpen = false;
 
+      // Removes the document-level listener(s) below on destroy().
+      this._abortController = new AbortController();
+
       this._createToolbar();
       this._setupEventListeners();
     }
@@ -2652,7 +2756,7 @@
         if (this.colorDropdownOpen && !this.element.contains(e.target)) {
           this._closeColorDropdown();
         }
-      });
+      }, { signal: this._abortController.signal });
 
       // Handle keyboard shortcuts
       this._keydownHandler = (e) => {
@@ -2800,6 +2904,7 @@
     }
 
     destroy() {
+      this._abortController.abort();
       if (this._keydownHandler) {
         document.removeEventListener("keydown", this._keydownHandler);
       }
@@ -2820,6 +2925,9 @@
       this.currentAnnotation = null;
       this.anchorElement = null;
       this.colorDropdownOpen = false;
+
+      // Removes the document-level listener(s) below on destroy().
+      this._abortController = new AbortController();
 
       this._createPanel();
       this._setupEventListeners();
@@ -2934,7 +3042,7 @@
         if (this.colorDropdownOpen && !this.element.contains(e.target)) {
           this._closeColorDropdown();
         }
-      });
+      }, { signal: this._abortController.signal });
 
       // Keyboard shortcuts
       this._keydownHandler = (e) => {
@@ -3022,6 +3130,16 @@
       return labels[annotationType] || "Annotation"
     }
 
+    /**
+     * Show the detail panel for an annotation.
+     * @param {Object} annotation
+     * @param {HTMLElement} anchorElement
+     * @param {Object} [options]
+     * @param {string|HTMLElement} [options.content] - Custom content rendered in
+     *   the panel's content slot. SECURITY: when passed as a string it is
+     *   assigned to innerHTML, so the consumer MUST supply trusted/sanitized
+     *   HTML. Pass a DOM element instead to avoid the raw-HTML path.
+     */
     show(annotation, anchorElement, options = {}) {
       this.currentAnnotation = annotation;
       this.anchorElement = anchorElement;
@@ -3138,6 +3256,7 @@
     }
 
     destroy() {
+      this._abortController.abort();
       if (this._keydownHandler) {
         document.removeEventListener("keydown", this._keydownHandler);
       }
@@ -3229,8 +3348,40 @@
     destroy() {
       if (this.hideTimeout) {
         clearTimeout(this.hideTimeout);
+        this.hideTimeout = null;
       }
+      // The container is host-owned and may be reused across reconnects; clear
+      // the injected buttons so their click listeners don't linger.
+      this.container.innerHTML = "";
     }
+  }
+
+  /**
+   * Color helpers shared across annotation rendering.
+   */
+
+  // Matches #RGB, #RGBA, #RRGGBB, and #RRGGBBAA hex colors only.
+  const HEX_COLOR_RE = /^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+
+  /**
+   * Validate a color before it is interpolated into HTML or a CSS string.
+   *
+   * Annotation colors come from the server and are otherwise untrusted; a value
+   * like `red"><img src=x onerror=...>` would break out of an attribute or CSS
+   * declaration. We only allow hex colors and fall back to a known-safe default
+   * for anything else. Use this at every sink where a color is concatenated into
+   * markup or `cssText` (DOM/CSSOM setters such as `setAttribute("fill", c)` and
+   * `style.color = c` are already injection-safe and don't need it).
+   *
+   * @param {string} color - Candidate color (typically annotation.color)
+   * @param {string} fallback - Color to use when `color` is missing/invalid
+   * @returns {string}
+   */
+  function sanitizeColor(color, fallback) {
+    if (typeof color === "string" && HEX_COLOR_RE.test(color)) {
+      return color
+    }
+    return fallback
   }
 
   /**
@@ -3427,6 +3578,10 @@
      */
     destroy() {
       this.cancelRendering();
+      // Release the PDF.js page proxy so its resources don't accumulate across
+      // documents in a long-lived session.
+      this.pdfPage?.cleanup?.();
+      this.pdfPage = null;
       this.div.remove();
     }
   }
@@ -3459,6 +3614,11 @@
       this.currentPage = 1;
       this.isOpen = false;
       this.sidebarWidth = SIDEBAR_DEFAULT_WIDTH$1;
+
+      // Removes all DOM, document, and EventBus listeners on destroy(). The
+      // EventBus subscriptions in particular would otherwise keep the sidebar
+      // (and its thumbnails/page proxies) alive via the viewer's shared bus.
+      this._abortController = new AbortController();
 
       this._createElements();
       this._setupEventListeners();
@@ -3498,14 +3658,16 @@
     }
 
     _setupEventListeners() {
+      const signal = this._abortController.signal;
+
       // Close button in header
       const closeBtn = this.header.querySelector(".pdf-sidebar-close");
-      closeBtn.addEventListener("click", () => this.close());
+      closeBtn.addEventListener("click", () => this.close(), { signal });
 
       // Thumbnail scroll - lazy load thumbnails
       this.thumbnailContainer.addEventListener("scroll", () => {
         this._renderVisibleThumbnails();
-      });
+      }, { signal });
 
       // Sidebar resizing
       this._setupResizer();
@@ -3513,7 +3675,7 @@
       // Listen for page changes from the viewer
       this.eventBus.on(ViewerEvents.PAGE_CHANGING, ({ pageNumber }) => {
         this._onPageChange(pageNumber);
-      });
+      }, { signal });
 
       // Listen for scroll events to update current page indicator
       this.eventBus.on(ViewerEvents.SCROLL, () => {
@@ -3521,12 +3683,12 @@
         if (currentPage !== this.currentPage) {
           this._onPageChange(currentPage);
         }
-      });
+      }, { signal });
 
       // Keyboard navigation within sidebar
       this.thumbnailContainer.addEventListener("keydown", (e) => {
         this._handleKeydown(e);
-      });
+      }, { signal });
     }
 
     _setupResizer() {
@@ -3554,9 +3716,11 @@
         this.element.classList.add("resizing");
         document.body.style.cursor = "ew-resize";
         document.body.style.userSelect = "none";
-        document.addEventListener("mousemove", onMouseMove);
-        document.addEventListener("mouseup", onMouseUp);
-      });
+        // Tie the drag listeners to the abort signal too, so they're removed if
+        // the sidebar is destroyed mid-drag.
+        document.addEventListener("mousemove", onMouseMove, { signal: this._abortController.signal });
+        document.addEventListener("mouseup", onMouseUp, { signal: this._abortController.signal });
+      }, { signal: this._abortController.signal });
     }
 
     _handleKeydown(e) {
@@ -3763,6 +3927,7 @@
      * Clean up
      */
     destroy() {
+      this._abortController.abort();
       for (const thumbnail of this.thumbnails) {
         thumbnail.destroy();
       }
@@ -4174,7 +4339,7 @@
 
         // Populate data-field elements
         this._setField(item, "icon", icon, annotation.color);
-        this._setField(item, "label", this._escapeHtml(label));
+        this._setField(item, "label", label);
         this._setField(item, "type", typeLabel);
         this._setField(item, "page", `Page ${annotation.page}`);
         this._setField(item, "time", timestamp);
@@ -4197,7 +4362,7 @@
         const timestamp = this._formatTimestamp(annotation.created_at);
 
         item.innerHTML = `
-        <div class="annotation-item-icon" style="color: ${annotation.color || '#666'}">
+        <div class="annotation-item-icon" style="color: ${sanitizeColor(annotation.color, '#666')}">
           ${icon}
         </div>
         <div class="annotation-item-content">
@@ -4234,19 +4399,28 @@
     }
 
     /**
-     * Set a field value in a template-cloned element
+     * Set a field value in a template-cloned element.
+     *
+     * Only the "icon" field is treated as trusted HTML (hard-coded SVG markup);
+     * every other field is set via textContent so untrusted annotation data
+     * (labels, snippets) can't inject markup.
      * @param {HTMLElement} element - The cloned template element
      * @param {string} fieldName - The data-field name to find
-     * @param {string} value - The value to set (can include HTML for icons)
-     * @param {string} color - Optional color to apply
+     * @param {string} value - The value to set (HTML only for the icon field)
+     * @param {string} color - Optional color to apply (icon field only)
      */
     _setField(element, fieldName, value, color) {
       const field = element.querySelector(`[data-field="${fieldName}"]`);
-      if (field) {
+      if (!field) return
+
+      if (fieldName === "icon") {
         field.innerHTML = value;
-        if (color && fieldName === "icon") {
+        if (color) {
+          // CSSOM setter rejects malformed values, so it's injection-safe.
           field.style.color = color;
         }
+      } else {
+        field.textContent = value;
       }
     }
 
@@ -5106,12 +5280,15 @@
     }
   }
 
-  // Singleton instance for shared use across the PDF viewer
+  // Singleton instance shared across all PDF viewers on the page, plus a
+  // reference count of the viewers currently holding it.
   let _sharedInstance = null;
+  let _refCount = 0;
 
   /**
-   * Get the shared announcer instance.
-   * Creates one if it doesn't exist.
+   * Get the shared announcer instance, creating it if needed.
+   * Use this for ad-hoc announcements; it does NOT take a reference. Viewers
+   * should call acquireAnnouncer()/destroyAnnouncer() to manage its lifecycle.
    * @returns {Announcer}
    */
   function getAnnouncer() {
@@ -5122,11 +5299,26 @@
   }
 
   /**
-   * Destroy the shared announcer instance.
-   * Call this when the PDF viewer is destroyed.
+   * Register a holder of the shared announcer (call once per viewer on init).
+   * Balanced by a later destroyAnnouncer() call.
+   * @returns {Announcer}
+   */
+  function acquireAnnouncer() {
+    _refCount++;
+    return getAnnouncer()
+  }
+
+  /**
+   * Release one holder's reference. The shared live regions are torn down only
+   * once the last holder releases, so destroying one viewer doesn't remove the
+   * region out from under another that's still active (e.g. two viewers
+   * overlapping briefly during Turbo navigation).
    */
   function destroyAnnouncer() {
-    if (_sharedInstance) {
+    if (_refCount > 0) {
+      _refCount--;
+    }
+    if (_refCount === 0 && _sharedInstance) {
       _sharedInstance.destroy();
       _sharedInstance = null;
     }
@@ -5567,20 +5759,6 @@
       return { x: pdfX, y: pdfY, pageNumber }
     }
 
-    // PDF coordinates (top-left origin) -> screen position
-    pdfToScreen(x, y, pageNumber) {
-      const pageContainer = this.viewer.getPageContainer(pageNumber);
-      if (!pageContainer) return null
-
-      const rect = pageContainer.getBoundingClientRect();
-      const scale = this.viewer.getScale();
-
-      const screenX = x * scale + rect.left;
-      const screenY = y * scale + rect.top;
-
-      return { x: screenX, y: screenY }
-    }
-
     // Convert selection rectangles to quads format
     selectionRectsToQuads(rects, pageNumber) {
       const pageContainer = this.viewer.getPageContainer(pageNumber);
@@ -5696,64 +5874,6 @@
       }
 
       return working
-    }
-
-    // Convert ink strokes from screen coordinates to PDF coordinates
-    strokesToPdfCoords(strokes, pageNumber) {
-      const pageContainer = this.viewer.getPageContainer(pageNumber);
-      if (!pageContainer) return []
-
-      const pageRect = pageContainer.getBoundingClientRect();
-      const scale = this.viewer.getScale();
-
-      return strokes.map(stroke => ({
-        points: stroke.points.map(point => ({
-          x: (point.x - pageRect.left) / scale,
-          y: (point.y - pageRect.top) / scale
-        }))
-      }))
-    }
-
-    // Convert freehand strokes to quads (for freehand highlight)
-    strokesPathToQuads(points, thickness, pageNumber) {
-      const pageContainer = this.viewer.getPageContainer(pageNumber);
-      if (!pageContainer) return []
-
-      const pageRect = pageContainer.getBoundingClientRect();
-      const scale = this.viewer.getScale();
-      const halfThickness = (thickness / 2) / scale;
-
-      const quads = [];
-
-      for (let i = 1; i < points.length; i++) {
-        const p1 = {
-          x: (points[i - 1].x - pageRect.left) / scale,
-          y: (points[i - 1].y - pageRect.top) / scale
-        };
-        const p2 = {
-          x: (points[i].x - pageRect.left) / scale,
-          y: (points[i].y - pageRect.top) / scale
-        };
-
-        // Calculate perpendicular offset for stroke width
-        const dx = p2.x - p1.x;
-        const dy = p2.y - p1.y;
-        const len = Math.sqrt(dx * dx + dy * dy);
-
-        if (len === 0) continue
-
-        const nx = -dy / len * halfThickness;
-        const ny = dx / len * halfThickness;
-
-        quads.push({
-          p1: { x: p1.x - nx, y: p1.y - ny },
-          p2: { x: p1.x + nx, y: p1.y + ny },
-          p3: { x: p2.x - nx, y: p2.y - ny },
-          p4: { x: p2.x + nx, y: p2.y + ny }
-        });
-      }
-
-      return quads
     }
 
     // Calculate bounding rect from quads
@@ -6433,7 +6553,6 @@
   class UnderlineTool extends TextSelectionTool {
     constructor(pdfViewer) {
       super(pdfViewer);
-      this.underlineColor = "#FF0000";
     }
 
     getModeClass() {
@@ -6682,11 +6801,16 @@
           ${Icons.close}
         </button>
       </div>
-      <textarea class="note-dialog-input" rows="4">${existingText || ""}</textarea>
+      <textarea class="note-dialog-input" rows="4"></textarea>
       <div class="note-dialog-actions">
         <button class="note-dialog-save">Save</button>
       </div>
     `;
+
+      // Set existing text via the DOM rather than interpolating it into the
+      // markup above — note contents are untrusted and could otherwise break out
+      // of the <textarea> (e.g. "</textarea><img onerror=...>").
+      this.noteDialog.querySelector(".note-dialog-input").value = existingText || "";
 
       document.body.appendChild(this.noteDialog);
 
@@ -7050,20 +7174,21 @@
         return { points: stroke.pdfPoints }
       });
 
-      // Create annotation
-      await this.annotationManager.createAnnotation({
-        annotation_type: "ink",
-        page: pageNumber,
-        ink_strokes: inkStrokes,
-        rect: [minX, minY, maxX - minX, maxY - minY],
-        color: color,
-        subject: "Free Hand"
-      });
-
-      // Remove temp elements after annotation is created
-      for (const stroke of strokesToSave) {
-        if (stroke.tempElement) {
-          stroke.tempElement.remove();
+      try {
+        // Create annotation
+        await this.annotationManager.createAnnotation({
+          annotation_type: "ink",
+          page: pageNumber,
+          ink_strokes: inkStrokes,
+          rect: [minX, minY, maxX - minX, maxY - minY],
+          color: color,
+          subject: "Free Hand"
+        });
+      } finally {
+        // Always remove the temp preview elements, even if the save failed —
+        // otherwise they're orphaned in the DOM with no remaining reference.
+        for (const stroke of strokesToSave) {
+          stroke.tempElement?.remove();
         }
       }
     }
@@ -7123,6 +7248,16 @@
       this.selectedAnnotationElement = null;
       this.pendingAnnotationSelection = null; // Annotation ID to select when rendered
       this._currentPage = 1; // Track current page for change detection
+
+      // Removes the document/container listeners added in _setupEventListeners()
+      // in one shot on destroy(); some live on the global document and would
+      // otherwise leak the viewer across reconnects.
+      this._abortController = new AbortController();
+
+      // Take a reference on the shared announcer; released in destroy(). Done
+      // unconditionally (even if _initializeComponents bails early) so it stays
+      // balanced with the destroyAnnouncer() call in destroy().
+      acquireAnnouncer();
 
       this._setupContainer();
       this._initializeComponents();
@@ -7331,6 +7466,8 @@
     }
 
     _setupEventListeners() {
+      const signal = this._abortController.signal;
+
       // Handle visibility change for time tracking
       document.addEventListener("visibilitychange", () => {
         if (document.hidden) {
@@ -7338,7 +7475,7 @@
         } else {
           this._resumeTracking();
         }
-      });
+      }, { signal });
 
       // Deselect annotation when clicking outside
       this.pagesContainer.addEventListener("click", (e) => {
@@ -7351,12 +7488,12 @@
           return
         }
         this._deselectAnnotation();
-      });
+      }, { signal });
 
       // Handle error events from annotation manager and other components
       this.container.addEventListener("pdf-viewer:error", (e) => {
         this._handleError(e.detail);
-      });
+      }, { signal });
     }
 
     /**
@@ -8070,7 +8207,7 @@
           top: ${((y - minY) / containerHeight) * 100}%;
           width: ${(width / containerWidth) * 100}%;
           height: ${(height / containerHeight) * 100}%;
-          background-color: ${annotation.color || ColorPicker.DEFAULT_HIGHLIGHT_COLOR};
+          background-color: ${sanitizeColor(annotation.color, ColorPicker.DEFAULT_HIGHLIGHT_COLOR)};
           opacity: ${annotation.opacity || 0.4};
           cursor: pointer;
         `;
@@ -8100,7 +8237,7 @@
     `;
 
       icon.innerHTML = `
-      <svg viewBox="0 0 24 24" fill="${annotation.color || ColorPicker.DEFAULT_HIGHLIGHT_COLOR}" stroke="#000" stroke-width="1">
+      <svg viewBox="0 0 24 24" fill="${sanitizeColor(annotation.color, ColorPicker.DEFAULT_HIGHLIGHT_COLOR)}" stroke="#000" stroke-width="1">
         <path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2z"/>
       </svg>
     `;
@@ -8452,22 +8589,28 @@
 
     // Cleanup
     destroy() {
+      // Remove the document/container listeners from _setupEventListeners()
+      this._abortController.abort();
+
       if (this._trackingInterval) {
         clearInterval(this._trackingInterval);
         this._sendTrackingUpdate();
       }
 
-      this.viewer.destroy();
-      this.annotationEditToolbar.destroy();
+      // Optional-chain every component: _initializeComponents() can bail out
+      // early (e.g. missing .pdf-pages-container), leaving these undefined, and
+      // destroy() must still tear down whatever did get created.
+      this.viewer?.destroy();
+      this.annotationEditToolbar?.destroy();
       this.annotationDetailPanel?.destroy();
-      this.undoBar.destroy();
+      this.undoBar?.destroy();
       this.thumbnailSidebar?.destroy();
       this.annotationSidebar?.destroy();
       this.findController?.destroy();
       this.findBar?.destroy();
       this.colorPicker?.destroy();
 
-      Object.values(this.tools).forEach(tool => tool.destroy?.());
+      Object.values(this.tools || {}).forEach(tool => tool.destroy?.());
 
       // Clean up the shared announcer
       destroyAnnouncer();
@@ -9068,6 +9211,7 @@
   exports.PdfViewer = PdfViewer;
   exports.PdfViewerController = pdf_viewer_controller;
   exports.RestAnnotationStore = RestAnnotationStore;
+  exports.ScaleValue = ScaleValue;
   exports.ToolMode = ToolMode;
   exports.ViewerEvents = ViewerEvents;
 

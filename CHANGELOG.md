@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-06-24
+
+### Added
+- Updated stimulus-pdf-viewer to 0.4.0
+
+This pulls in page rotation support (pages with a `/Rotate` value now render
+upright, with text selection and annotation overlays aligned), a stored-XSS fix
+for untrusted annotation data, a crash fix when loading a new PDF, per-page
+sizing for mixed documents, canvas-size clamping for large/zoomed pages, and a
+broad memory-leak cleanup. No breaking changes. See the upstream
+[0.4.0 changelog](https://github.com/jhubert/stimulus-pdf-viewer/blob/main/CHANGELOG.md)
+for full details.
+
 ## [0.3.2] - 2026-05-13
 
 ### Added
