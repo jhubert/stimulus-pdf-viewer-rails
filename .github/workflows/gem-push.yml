@@ -18,12 +18,18 @@ jobs:
       uses: ruby/setup-ruby@v1
       with:
         ruby-version: '3.2'
-        # Gemfile.lock is gitignored for this gem, so setup-ruby would otherwise
-        # fall back to Ruby 3.2's built-in Bundler 2.4.19, which can't load the
-        # securerandom default gem at the resolved version and fails
-        # `bundle exec rake release`. Pin a modern bundler that handles it.
-        bundler: '2.5.23'
-        bundler-cache: true
 
-    - name: Publish to RubyGems
-      uses: rubygems/release-gem@v1
+    # Build and publish via RubyGems trusted publishing (OIDC). We intentionally
+    # do NOT use `rubygems/release-gem` / `bundle exec rake release`: activating
+    # the bundle pulls railties -> securerandom 0.4.1, which conflicts with Ruby
+    # 3.2's already-activated default securerandom (0.2.2) and fails before rake
+    # even runs — and no Bundler version fixes that on 3.2. `gem build` and
+    # `gem push` need neither bundler nor the dependency tree. The git tag is
+    # already created by the GitHub release, so `rake release`'s tag push isn't
+    # needed either.
+    - name: Configure RubyGems credentials
+      uses: rubygems/configure-rubygems-credentials@dc5a8d8553e6ee01fc26761a49e99e733d17954a
+    - name: Build gem
+      run: gem build *.gemspec
+    - name: Push gem
+      run: gem push *.gem
