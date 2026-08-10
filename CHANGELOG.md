@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-08-10
+
+### Fixed
+- Updated stimulus-pdf-viewer to 0.4.1
+
+This fixes `initialAnnotation` deep-links, which never scrolled to or selected
+the annotation (a string/number id mismatch in the annotation map lookup), and
+gives deep-linked annotations the same flash/highlight treatment as sidebar
+clicks. See the upstream
+[0.4.1 changelog](https://github.com/jhubert/stimulus-pdf-viewer/blob/main/CHANGELOG.md)
+for full details.
+
 ## [0.4.0] - 2026-06-24
 
 ### Added

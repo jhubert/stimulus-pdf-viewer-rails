@@ -1749,7 +1749,7 @@
       this.annotationsByPage.clear();
 
       for (const annotation of annotationsData) {
-        this.annotations.set(annotation.id, annotation);
+        this.annotations.set(this._key(annotation.id), annotation);
 
         if (!this.annotationsByPage.has(annotation.page)) {
           this.annotationsByPage.set(annotation.page, []);
@@ -1758,8 +1758,14 @@
       }
     }
 
+    // Ids arrive as numbers from JSON payloads but as strings from DOM
+    // datasets and Stimulus values, so the map is keyed by string
+    _key(id) {
+      return String(id)
+    }
+
     getAnnotation(id) {
-      return this.annotations.get(id)
+      return this.annotations.get(this._key(id))
     }
 
     getAnnotationsForPage(pageNumber) {
@@ -1805,7 +1811,7 @@
     }
 
     async deleteAnnotation(id) {
-      const existingAnnotation = this.annotations.get(id);
+      const existingAnnotation = this.getAnnotation(id);
       if (!existingAnnotation) return
 
       try {
@@ -1844,7 +1850,7 @@
     }
 
     _addAnnotation(annotation) {
-      this.annotations.set(annotation.id, annotation);
+      this.annotations.set(this._key(annotation.id), annotation);
 
       if (!this.annotationsByPage.has(annotation.page)) {
         this.annotationsByPage.set(annotation.page, []);
@@ -1853,7 +1859,7 @@
     }
 
     _updateAnnotation(annotation) {
-      const oldAnnotation = this.annotations.get(annotation.id);
+      const oldAnnotation = this.getAnnotation(annotation.id);
       if (!oldAnnotation) {
         this._addAnnotation(annotation);
         return
@@ -1870,27 +1876,27 @@
       } else {
         // Update in place
         const pageAnnotations = this.annotationsByPage.get(annotation.page);
-        const index = pageAnnotations.findIndex(a => a.id === annotation.id);
+        const index = pageAnnotations.findIndex(a => this._key(a.id) === this._key(annotation.id));
         if (index !== -1) {
           pageAnnotations[index] = annotation;
         }
       }
 
-      this.annotations.set(annotation.id, annotation);
+      this.annotations.set(this._key(annotation.id), annotation);
     }
 
     _removeAnnotation(id) {
-      const annotation = this.annotations.get(id);
+      const annotation = this.getAnnotation(id);
       if (!annotation) return
 
       this._removeAnnotationFromPage(id, annotation.page);
-      this.annotations.delete(id);
+      this.annotations.delete(this._key(id));
     }
 
     _removeAnnotationFromPage(id, pageNumber) {
       const pageAnnotations = this.annotationsByPage.get(pageNumber);
       if (pageAnnotations) {
-        const index = pageAnnotations.findIndex(a => a.id === id);
+        const index = pageAnnotations.findIndex(a => this._key(a.id) === this._key(id));
         if (index !== -1) {
           pageAnnotations.splice(index, 1);
         }
@@ -4383,7 +4389,7 @@
       }
 
       // Selection state
-      if (this.selectedAnnotationId === annotation.id) {
+      if (this.selectedAnnotationId === String(annotation.id)) {
         item.classList.add("selected");
       }
 
@@ -4491,6 +4497,9 @@
     }
 
     _selectItem(annotationId) {
+      // Ids arrive as numbers from JSON payloads but as strings from DOM
+      // datasets and deep-links, so selection state is tracked as string
+      annotationId = String(annotationId);
       const previousId = this.selectedAnnotationId;
 
       // Skip if already selected
@@ -4547,7 +4556,7 @@
     onAnnotationDeleted(annotation) {
       if (this.isOpen) {
         // Clear selection if deleted annotation was selected
-        if (this.selectedAnnotationId === annotation.id) {
+        if (this.selectedAnnotationId === String(annotation.id)) {
           const previousId = this.selectedAnnotationId;
           this.selectedAnnotationId = null;
           this.element.dispatchEvent(new CustomEvent("pdf-sidebar:annotation-deselected", {
@@ -7547,9 +7556,10 @@
           this.viewer.goToPage(this.initialPage);
         }
 
-        // Navigate to initial annotation if specified
+        // Navigate to initial annotation if specified, flashing it so
+        // deep-link visitors can spot it immediately
         if (this.initialAnnotation) {
-          this._scrollToAnnotation(this.initialAnnotation);
+          this._scrollToAnnotationWithFlash(this.initialAnnotation);
         }
 
         // Start with select tool
@@ -8448,20 +8458,9 @@
       }
     }
 
-    _scrollToAnnotation(annotationId) {
-      const annotation = this.annotationManager.getAnnotation(annotationId);
-      if (!annotation) return
-
-      // Mark this annotation for selection when it's rendered
-      this.pendingAnnotationSelection = annotationId;
-
-      // Go to the page - the annotation will be selected in _renderAnnotationsForPage
-      this.viewer.goToPage(annotation.page);
-    }
-
     /**
      * Scroll to annotation and flash/highlight it.
-     * Called from the annotation sidebar when clicking an annotation.
+     * Called from the annotation sidebar and for initial deep-links.
      */
     _scrollToAnnotationWithFlash(annotationId) {
       const annotation = this.annotationManager.getAnnotation(annotationId);
