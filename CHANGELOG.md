@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-08-11
+
+### Added
+- Updated stimulus-pdf-viewer to 0.5.0
+
+Adds support for password-protected PDFs: the viewer prompts for the password
+(with retry on incorrect entry) and opens encrypted documents in read-only
+mode — annotation tools are disabled and the download button delivers the
+original file. The vendored stylesheet includes new rules for the password
+prompt and read-only mode, so recompile your assets after upgrading. See the
+upstream
+[0.5.0 changelog](https://github.com/jhubert/stimulus-pdf-viewer/blob/main/CHANGELOG.md)
+for full details.
+
 ## [0.4.1] - 2026-08-10
 
 ### Fixed
