@@ -389,10 +389,20 @@
       this.container = container;
       this.eventBus = options.eventBus || new EventBus();
 
+      // Called when the document needs a password: ({ retry }) => Promise<string>.
+      // Resolve with the password, reject to abort the load. When absent,
+      // password-protected documents fail to load with a PasswordException.
+      this.onPasswordRequest = options.onPasswordRequest || null;
+
       // PDF.js document reference
       this.pdfDocument = null;
       this._loadingTask = null;
       this.pageCount = 0;
+
+      // Whether the loaded document is encrypted (user- or owner-password).
+      // Valid after load() resolves.
+      this.isEncrypted = false;
+      this._lastPassword = null;
 
       // Page data storage: pageNumber -> PageData
       this.pages = new Map();
@@ -454,6 +464,8 @@
      * @returns {Promise<PDFDocumentProxy>}
      */
     async load(url) {
+      this._lastPassword = null;
+      this.isEncrypted = false;
       try {
         return await this._loadDocument(url)
       } catch (error) {
@@ -465,7 +477,10 @@
               throw new Error(`HTTP ${response.status} fetching PDF`)
             }
             const data = new Uint8Array(await response.arrayBuffer());
-            return await this._loadDocument({ data })
+            // Reuse a password entered during the streamed attempt so the
+            // fallback doesn't prompt the user a second time
+            const source = this._lastPassword ? { data, password: this._lastPassword } : { data };
+            return await this._loadDocument(source)
           } catch (retryError) {
             console.error("PDF blob fallback also failed:", retryError);
             this.eventBus.dispatch(ViewerEvents.DOCUMENT_LOAD_ERROR, { error: retryError });
@@ -491,8 +506,31 @@
       await this._teardownDocument();
 
       this._loadingTask = pdfjsLib__namespace.getDocument(source);
+
+      // Prompt for a password instead of failing with PasswordException. PDF.js
+      // calls onPassword again with INCORRECT_PASSWORD after a wrong attempt;
+      // passing an Error to updatePassword aborts the load.
+      if (this.onPasswordRequest) {
+        this._loadingTask.onPassword = (updatePassword, reason) => {
+          const retry = reason === pdfjsLib__namespace.PasswordResponses.INCORRECT_PASSWORD;
+          Promise.resolve(this.onPasswordRequest({ retry }))
+            .then(password => {
+              this._lastPassword = password;
+              updatePassword(password);
+            })
+            .catch(error => {
+              updatePassword(error instanceof Error ? error : new Error("Password entry cancelled"));
+            });
+        };
+      }
+
       this.pdfDocument = await this._loadingTask.promise;
       this.pageCount = this.pdfDocument.numPages;
+
+      // getPermissions() returns null for unencrypted documents. Any encryption
+      // (user- or owner-password) makes the document read-only downstream:
+      // pdf-lib can't open encrypted files to embed annotations on download.
+      this.isEncrypted = (await this.pdfDocument.getPermissions()) !== null;
 
       // Set initial display scale on container
       this.container.style.setProperty("--display-scale", String(this.displayScale));
@@ -2004,6 +2042,16 @@
 
       // Save and download
       const pdfBytes = await pdfDoc.save();
+      const filename = this._sanitizeFilename(this.documentName || "document");
+      this._triggerDownload(pdfBytes, filename);
+    }
+
+    // Download the original file untouched. Used for encrypted documents, which
+    // pdf-lib can't open to embed annotations or the watermark.
+    async downloadOriginal() {
+      const request = new request_js.FetchRequest("get", this.documentUrl, { responseKind: "blob" });
+      const response = await request.perform();
+      const pdfBytes = await response.response.arrayBuffer();
       const filename = this._sanitizeFilename(this.documentName || "document");
       this._triggerDownload(pdfBytes, filename);
     }
@@ -5628,6 +5676,122 @@
     }
   }
 
+  /**
+   * PasswordPrompt - Modal dialog for unlocking password-protected PDFs.
+   *
+   * Shown over the viewer when PDF.js requests a password during document
+   * load. Each request() call returns a promise that resolves with the
+   * entered password, or rejects when the user cancels.
+   */
+
+  class PasswordPrompt {
+    constructor(options = {}) {
+      this.container = options.container;
+
+      this.element = null;
+      this.inputElement = null;
+      this.errorElement = null;
+
+      this._pending = null; // { resolve, reject } for the in-flight request
+
+      this._createUI();
+      this._setupEventListeners();
+    }
+
+    _createUI() {
+      this.element = document.createElement("div");
+      this.element.className = "pdf-password-prompt hidden";
+      this.element.innerHTML = `
+      <div class="pdf-password-prompt-dialog" role="dialog" aria-modal="true" aria-labelledby="pdf-password-prompt-title">
+        <h2 class="pdf-password-prompt-title" id="pdf-password-prompt-title">Password required</h2>
+        <p class="pdf-password-prompt-message">This document is protected. Enter the password to open it.</p>
+        <p class="pdf-password-prompt-error hidden">Incorrect password. Please try again.</p>
+        <input type="password" class="pdf-password-prompt-input" autocomplete="off" aria-label="Document password">
+        <div class="pdf-password-prompt-buttons">
+          <button type="button" class="pdf-password-prompt-btn pdf-password-prompt-cancel">Cancel</button>
+          <button type="button" class="pdf-password-prompt-btn pdf-password-prompt-submit">Open</button>
+        </div>
+      </div>
+    `;
+
+      this.inputElement = this.element.querySelector(".pdf-password-prompt-input");
+      this.errorElement = this.element.querySelector(".pdf-password-prompt-error");
+      this.submitButton = this.element.querySelector(".pdf-password-prompt-submit");
+      this.cancelButton = this.element.querySelector(".pdf-password-prompt-cancel");
+
+      this.container.appendChild(this.element);
+    }
+
+    _setupEventListeners() {
+      this.submitButton.addEventListener("click", () => this._submit());
+      this.cancelButton.addEventListener("click", () => this._cancel());
+
+      this.element.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          this._submit();
+        } else if (e.key === "Escape") {
+          e.preventDefault();
+          this._cancel();
+        }
+      });
+    }
+
+    /**
+     * Ask the user for the document password.
+     * @param {Object} options
+     * @param {boolean} options.retry - Whether a previous attempt was incorrect
+     * @returns {Promise<string>} Resolves with the password, rejects on cancel
+     */
+    request({ retry = false } = {}) {
+      return new Promise((resolve, reject) => {
+        // A request should never overlap another, but if it does, cancel the old one
+        this._pending?.reject(new Error("Password entry cancelled"));
+        this._pending = { resolve, reject };
+
+        this.errorElement.classList.toggle("hidden", !retry);
+        this.inputElement.value = "";
+        this.element.classList.remove("hidden");
+        this.inputElement.focus({ preventScroll: true });
+      })
+    }
+
+    _submit() {
+      const password = this.inputElement.value;
+      if (!password) {
+        this.inputElement.focus({ preventScroll: true });
+        return
+      }
+
+      const pending = this._pending;
+      this._pending = null;
+      this._hide();
+      pending?.resolve(password);
+    }
+
+    _cancel() {
+      const pending = this._pending;
+      this._pending = null;
+      this._hide();
+      pending?.reject(new Error("Password entry cancelled"));
+    }
+
+    _hide() {
+      this.element.classList.add("hidden");
+      this.inputElement.value = "";
+    }
+
+    /**
+     * Clean up. Safe to call multiple times.
+     */
+    destroy() {
+      this._pending?.reject(new Error("Password entry cancelled"));
+      this._pending = null;
+      this.element?.remove();
+      this.element = null;
+    }
+  }
+
   class BaseTool {
     constructor(pdfViewer) {
       this.pdfViewer = pdfViewer;
@@ -7253,6 +7417,9 @@
 
       this.currentTool = null;
       this.currentMode = ToolMode.SELECT;
+      // True once an encrypted document is loaded: annotations and annotated
+      // download are disabled (pdf-lib can't open encrypted files)
+      this.readOnly = false;
       this.selectedAnnotation = null;
       this.selectedAnnotationElement = null;
       this.pendingAnnotationSelection = null; // Annotation ID to select when rendered
@@ -7294,9 +7461,13 @@
         return
       }
 
+      // Modal shown when a document needs a password to open
+      this.passwordPrompt = new PasswordPrompt({ container: this.container });
+
       // Core viewer (PDF.js wrapper with lazy rendering and events)
       this.viewer = new CoreViewer(this.pagesContainer, {
-        initialScale: 1.0
+        initialScale: 1.0,
+        onPasswordRequest: ({ retry }) => this.passwordPrompt.request({ retry })
       });
 
       // Subscribe to core viewer events
@@ -7440,9 +7611,11 @@
      */
     _onDocumentLoaded(pageCount) {
       this._currentPage = 1;
+      this.readOnly = this.viewer.isEncrypted;
       this._dispatchEvent("pdf-viewer:ready", {
         pageCount,
-        currentPage: 1
+        currentPage: 1,
+        readOnly: this.readOnly
       });
     }
 
@@ -7539,11 +7712,12 @@
           await this.thumbnailSidebar.setDocument(this.viewer.pdfDocument);
         }
 
-        // Load existing annotations from store
-        await this.annotationManager.loadAnnotations();
-
-        // Render annotations on all rendered pages
-        this._renderAnnotations();
+        // Load existing annotations from store and render them on all rendered
+        // pages. Skipped for encrypted documents, which are view-only.
+        if (!this.readOnly) {
+          await this.annotationManager.loadAnnotations();
+          this._renderAnnotations();
+        }
 
         const annotations = this.annotationManager.getAllAnnotations();
         this.container.dispatchEvent(new CustomEvent("pdf-viewer:annotations-loaded", {
@@ -7574,6 +7748,11 @@
     }
 
     setTool(mode) {
+      // Encrypted documents are view-only: only the select tool is allowed
+      if (this.readOnly && mode !== ToolMode.SELECT) {
+        return
+      }
+
       // Deactivate current tool
       if (this.currentTool) {
         this.currentTool.deactivate();
@@ -8576,10 +8755,15 @@
       });
     }
 
-    // Download with annotations
+    // Download with annotations (or the original file for encrypted documents,
+    // which pdf-lib can't open to embed annotations)
     async download() {
       try {
-        await this.downloadManager.downloadWithAnnotations();
+        if (this.readOnly) {
+          await this.downloadManager.downloadOriginal();
+        } else {
+          await this.downloadManager.downloadWithAnnotations();
+        }
       } catch (error) {
         console.error("Failed to download PDF:", error);
         throw error
@@ -8608,6 +8792,7 @@
       this.findController?.destroy();
       this.findBar?.destroy();
       this.colorPicker?.destroy();
+      this.passwordPrompt?.destroy();
 
       Object.values(this.tools || {}).forEach(tool => tool.destroy?.());
 
@@ -8677,7 +8862,9 @@
       if (this.hasLoadingOverlayTarget) {
         this.loadingOverlayTarget.classList.add("hidden");
       }
-      const message = this.errorMessageValue || "Failed to load PDF document";
+      const isPasswordError = /password/i.test(String(error?.message || "")) || /password/i.test(String(error?.name || ""));
+      const message = this.errorMessageValue ||
+        (isPasswordError ? "A password is required to open this document" : "Failed to load PDF document");
       this._showError(message);
       this.containerTarget.dispatchEvent(new CustomEvent("pdf-viewer:load-failed", {
         bubbles: true,
@@ -8858,6 +9045,10 @@
     }
 
     _activateTool(toolName) {
+      // View-only for encrypted documents; the buttons are disabled, but guard
+      // against keyboard/programmatic activation too
+      if (this._readOnly && toolName !== "select") return
+
       // Tool map for name -> mode conversion
       const toolMap = {
         select: ToolMode.SELECT,
@@ -9043,8 +9234,8 @@
     _setupPageNavigationListeners() {
       // Listen for ready event from PdfViewer
       this._readyHandler = (e) => {
-        const { pageCount, currentPage } = e.detail;
-        this._onViewerReady(pageCount, currentPage);
+        const { pageCount, currentPage, readOnly } = e.detail;
+        this._onViewerReady(pageCount, currentPage, readOnly);
       };
       this.containerTarget.addEventListener("pdf-viewer:ready", this._readyHandler);
 
@@ -9056,10 +9247,14 @@
       this.containerTarget.addEventListener("pdf-viewer:page-changed", this._pageChangedHandler);
     }
 
-    _onViewerReady(pageCount, currentPage) {
+    _onViewerReady(pageCount, currentPage, readOnly) {
       // Hide the loading overlay
       if (this.hasLoadingOverlayTarget) {
         this.loadingOverlayTarget.classList.add("hidden");
+      }
+
+      if (readOnly) {
+        this._enterReadOnlyMode();
       }
 
       if (this.hasPageCountTarget) {
@@ -9080,6 +9275,16 @@
 
       // Set initial zoom to "auto" which fits the page width for portrait documents
       this._setZoomPreset("auto");
+    }
+
+    // Encrypted documents are view-only: disable the annotation tools and hide
+    // the color picker. Download stays enabled but delivers the original file.
+    _enterReadOnlyMode() {
+      this._readOnly = true;
+      this.containerTarget.classList.add("pdf-viewer-read-only");
+      this.containerTarget
+        .querySelectorAll('.pdf-tool-btn[data-tool]:not([data-tool="select"]), .pdf-overflow-tool-btn[data-tool]:not([data-tool="select"])')
+        .forEach(btn => { btn.disabled = true; });
     }
 
     _onPageChanged(currentPage, pageCount) {
