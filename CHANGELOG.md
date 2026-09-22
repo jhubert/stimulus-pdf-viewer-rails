@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.0] - 2026-09-22
+
+### Fixed
+- Updated stimulus-pdf-viewer to 0.6.0
+
+Annotated downloads now include everything shown on screen. Underlines were
+never exported, because the download code expected an `annotation_type` of
+`underline` while the underline tool created `line`. Comments on highlights,
+underlines, and drawings are now exported too. Curly quotes, em dashes, and
+non-Latin text in comments and notes no longer come out garbled. See the
+upstream
+[0.6.0 release notes](https://github.com/jhubert/stimulus-pdf-viewer/releases/tag/v0.6.0)
+for details.
+
+### Upgrade notes
+- New underlines are saved with `annotation_type: "underline"` instead of
+  `"line"`. Make sure your `Annotation` model accepts `underline`; with an
+  integer enum, rename the `line` key in place. Stored `"line"` records keep
+  working, but they are deprecated. The upstream release notes give the SQL to
+  migrate them.
+
 ## [0.5.0] - 2026-08-11
 
 ### Added

@@ -1714,6 +1714,115 @@
     }
   }
 
+  // Canonical annotation vocabulary.
+  //
+  // `annotation_type` travels over the REST API and is stored in the consuming
+  // application's database, so inbound records may still carry legacy values that
+  // this library no longer emits. Records are normalized once on the way in (see
+  // AnnotationManager); everything downstream may assume the canonical names.
+  //
+  // These are the annotation types, not the editing modes -- see ToolMode in
+  // index.js, which adds SELECT and otherwise uses the same strings.
+
+  const AnnotationType = {
+    HIGHLIGHT: "highlight",
+    UNDERLINE: "underline",
+    NOTE: "note",
+    INK: "ink"
+  };
+
+  // Legacy `annotation_type` values accepted on read and rewritten to canonical
+  // names. "line" was the original spelling of underline; it is also actively
+  // misleading, naming the PDF spec's Line annotation (subtype 4) -- a different
+  // annotation that this viewer does not support.
+  const LEGACY_TYPE_ALIASES = {
+    line: AnnotationType.UNDERLINE
+  };
+
+  // Marks an ink annotation drawn with the highlighter rather than the pen. This
+  // lives on `subject` rather than being its own type because both are genuinely
+  // Ink annotations once exported to PDF.
+  const FREE_HIGHLIGHT_SUBJECT = "Free Highlight";
+
+  // PDF annotation subtype each canonical type is written as by DownloadManager
+  // when baking annotations into the file. See PDF 32000-1:2008 section 12.5.6.
+  const PDF_SUBTYPES = {
+    [AnnotationType.HIGHLIGHT]: "Highlight",
+    [AnnotationType.UNDERLINE]: "Underline",
+    [AnnotationType.NOTE]: "Text",
+    [AnnotationType.INK]: "Ink"
+  };
+
+  // Legacy values already warned about, so a document full of them produces one
+  // warning per type rather than one per annotation.
+  const warnedLegacyTypes = new Set();
+
+  /**
+   * Map a possibly-legacy annotation type onto the canonical vocabulary.
+   *
+   * Warns once per legacy value encountered. The aliases exist only to carry
+   * records written by earlier versions, and are slated for removal; the warning
+   * is how a consuming application finds out it still has rows to migrate while
+   * that support is still in place.
+   *
+   * @param {string} type
+   * @returns {string}
+   */
+  function normalizeAnnotationType(type) {
+    const canonical = LEGACY_TYPE_ALIASES[type];
+    if (!canonical) return type
+
+    if (!warnedLegacyTypes.has(type)) {
+      warnedLegacyTypes.add(type);
+      console.warn(
+        `[stimulus-pdf-viewer] Deprecated annotation_type "${type}" was read and ` +
+        `treated as "${canonical}". Support for the old value will be removed in a ` +
+        `future release. Migrate stored annotations: ` +
+        `UPDATE annotations SET annotation_type = '${canonical}' WHERE annotation_type = '${type}'.`
+      );
+    }
+
+    return canonical
+  }
+
+  /**
+   * Rewrite a record's annotation_type in place. Mutates rather than clones so
+   * that references already held elsewhere (selectedAnnotation, rendered sidebar
+   * rows) observe the same canonical value.
+   * @param {Object} annotation
+   * @returns {Object} the same annotation
+   */
+  function normalizeAnnotation(annotation) {
+    if (annotation && annotation.annotation_type) {
+      annotation.annotation_type = normalizeAnnotationType(annotation.annotation_type);
+    }
+    return annotation
+  }
+
+  /** An ink annotation drawn with the highlighter tool. */
+  function isFreeHighlight(annotation) {
+    return annotation?.annotation_type === AnnotationType.INK &&
+      annotation?.subject === FREE_HIGHLIGHT_SUBJECT
+  }
+
+  /** Highlights and highlighter-drawn ink both render as highlights. */
+  function isHighlightLike(annotation) {
+    return annotation?.annotation_type === AnnotationType.HIGHLIGHT ||
+      isFreeHighlight(annotation)
+  }
+
+  /** Ink drawn with the pen, as opposed to the highlighter. */
+  function isDrawing(annotation) {
+    return annotation?.annotation_type === AnnotationType.INK &&
+      !isFreeHighlight(annotation)
+  }
+
+  /** Types whose contents are editable as a comment via the note dialog. */
+  function supportsComment(annotation) {
+    return [AnnotationType.HIGHLIGHT, AnnotationType.UNDERLINE, AnnotationType.INK]
+      .includes(annotation?.annotation_type)
+  }
+
   // Custom event types for error handling
   const AnnotationErrorType = {
     LOAD_FAILED: "load_failed",
@@ -1787,6 +1896,7 @@
       this.annotationsByPage.clear();
 
       for (const annotation of annotationsData) {
+        normalizeAnnotation(annotation);
         this.annotations.set(this._key(annotation.id), annotation);
 
         if (!this.annotationsByPage.has(annotation.page)) {
@@ -1888,6 +1998,8 @@
     }
 
     _addAnnotation(annotation) {
+      normalizeAnnotation(annotation);
+
       this.annotations.set(this._key(annotation.id), annotation);
 
       if (!this.annotationsByPage.has(annotation.page)) {
@@ -1897,6 +2009,8 @@
     }
 
     _updateAnnotation(annotation) {
+      normalizeAnnotation(annotation);
+
       const oldAnnotation = this.getAnnotation(annotation.id);
       if (!oldAnnotation) {
         this._addAnnotation(annotation);
@@ -2085,16 +2199,16 @@
     _applyAnnotationsToPage(pdfDoc, page, annotations, pageHeight) {
       for (const annotation of annotations) {
         switch (annotation.annotation_type) {
-          case "highlight":
+          case AnnotationType.HIGHLIGHT:
             this._applyHighlight(pdfDoc, page, annotation, pageHeight);
             break
-          case "underline":
+          case AnnotationType.UNDERLINE:
             this._applyUnderline(pdfDoc, page, annotation, pageHeight);
             break
-          case "ink":
+          case AnnotationType.INK:
             this._applyInk(pdfDoc, page, annotation, pageHeight);
             break
-          case "note":
+          case AnnotationType.NOTE:
             this._applyNote(pdfDoc, page, annotation, pageHeight);
             break
         }
@@ -2133,7 +2247,7 @@
 
       const annotationDict = pdfDoc.context.obj({
         Type: pdfLib.PDFName.of("Annot"),
-        Subtype: pdfLib.PDFName.of("Highlight"),
+        Subtype: pdfLib.PDFName.of(PDF_SUBTYPES[AnnotationType.HIGHLIGHT]),
         Rect: [minX, minY, maxX, maxY],
         QuadPoints: quadPoints,
         C: [rgba.r, rgba.g, rgba.b],
@@ -2174,7 +2288,7 @@
 
       const annotationDict = pdfDoc.context.obj({
         Type: pdfLib.PDFName.of("Annot"),
-        Subtype: pdfLib.PDFName.of("Underline"),
+        Subtype: pdfLib.PDFName.of(PDF_SUBTYPES[AnnotationType.UNDERLINE]),
         Rect: [minX, minY, maxX, maxY],
         QuadPoints: quadPoints,
         C: [rgba.r, rgba.g, rgba.b],
@@ -2187,7 +2301,7 @@
 
     _applyInk(pdfDoc, page, annotation, pageHeight) {
       // Freehand highlights need different rendering (thick, semi-transparent strokes)
-      if (annotation.subject === "Free Highlight") {
+      if (isFreeHighlight(annotation)) {
         this._applyFreehandHighlight(pdfDoc, page, annotation, pageHeight);
         return
       }
@@ -2259,7 +2373,7 @@
 
       const annotationDict = pdfDoc.context.obj({
         Type: pdfLib.PDFName.of("Annot"),
-        Subtype: pdfLib.PDFName.of("Ink"),
+        Subtype: pdfLib.PDFName.of(PDF_SUBTYPES[AnnotationType.INK]),
         Rect: [minX, minY, maxX, maxY],
         InkList: inkList,
         C: [rgba.r, rgba.g, rgba.b],
@@ -2355,7 +2469,7 @@
 
       const annotationDict = pdfDoc.context.obj({
         Type: pdfLib.PDFName.of("Annot"),
-        Subtype: pdfLib.PDFName.of("Ink"),
+        Subtype: pdfLib.PDFName.of(PDF_SUBTYPES[AnnotationType.INK]),
         Rect: [minX, minY, maxX, maxY],
         InkList: inkList,
         C: [rgba.r, rgba.g, rgba.b],
@@ -2381,9 +2495,8 @@
 
       const annotationDict = pdfDoc.context.obj({
         Type: pdfLib.PDFName.of("Annot"),
-        Subtype: pdfLib.PDFName.of("Text"),
+        Subtype: pdfLib.PDFName.of(PDF_SUBTYPES[AnnotationType.NOTE]),
         Rect: [x, pdfY - iconSize, x + iconSize, pdfY],
-        Contents: pdfLib.PDFString.of(contents),
         C: [rgba.r, rgba.g, rgba.b],
         Name: pdfLib.PDFName.of("Comment"),
         Open: false,
@@ -2447,6 +2560,13 @@
         metadata.T = pdfLib.PDFString.of(this.userName);
       }
 
+      // Contents - a note's body, or the comment on any other annotation type.
+      // fromText encodes as UTF-16BE when needed; PDFString.of only covers
+      // PDFDocEncoding and mangles curly quotes, dashes, and the like.
+      if (annotation.contents) {
+        metadata.Contents = pdfLib.PDFHexString.fromText(annotation.contents);
+      }
+
       // Modification date (M) - use annotation's updated_at or created_at
       const dateStr = annotation.updated_at || annotation.created_at;
       if (dateStr) {
@@ -2507,12 +2627,17 @@
         .replace(/\s+/g, " ")          // Normalize whitespace
         .trim();
 
+      // Check for emptiness before appending the extension. A name made only of
+      // illegal characters is empty at this point, and appending first would
+      // produce a hidden ".pdf" file instead of falling back.
+      if (!sanitized) return "document.pdf"
+
       // Ensure it ends with .pdf
       if (!sanitized.toLowerCase().endsWith(".pdf")) {
         sanitized += ".pdf";
       }
 
-      return sanitized || "document.pdf"
+      return sanitized
     }
 
     _triggerDownload(bytes, filename) {
@@ -2842,8 +2967,8 @@
           }
         } else if (e.key === "c" || e.key === "C") {
           // Comment shortcut for highlight/underline/ink annotations
-          const supportsComment = ["highlight", "line", "ink"].includes(this.currentAnnotation?.annotation_type);
-          if (supportsComment && this.onComment) {
+          const canComment = supportsComment(this.currentAnnotation);
+          if (canComment && this.onComment) {
             e.preventDefault();
             this.onComment(this.currentAnnotation);
           }
@@ -2905,14 +3030,14 @@
 
       // Show/hide buttons based on annotation type
       const isNote = annotation.annotation_type === "note";
-      const supportsComment = ["highlight", "line", "ink"].includes(annotation.annotation_type);
+      const canComment = supportsComment(annotation);
 
       // Comment button for highlight/underline/ink, edit button for notes
-      this.commentBtn.classList.toggle("hidden", !supportsComment);
+      this.commentBtn.classList.toggle("hidden", !canComment);
       this.editBtn.classList.toggle("hidden", !isNote);
 
       // Update comment button title based on whether contents exists
-      if (supportsComment) {
+      if (canComment) {
         const hasComment = annotation.contents && annotation.contents.trim();
         this.commentBtn.title = hasComment ? "Edit Comment (C)" : "Add Comment (C)";
       }
@@ -3118,13 +3243,13 @@
             this.onDelete(this.currentAnnotation);
           }
         } else if (e.key === "e" || e.key === "E") {
-          if (this.currentAnnotation?.annotation_type === "note" && this.onEdit) {
+          if (this.currentAnnotation?.annotation_type === AnnotationType.NOTE && this.onEdit) {
             e.preventDefault();
             this.onEdit(this.currentAnnotation);
           }
         } else if (e.key === "c" || e.key === "C") {
-          const supportsComment = ["highlight", "line", "ink"].includes(this.currentAnnotation?.annotation_type);
-          if (supportsComment && this.onComment) {
+          const canComment = supportsComment(this.currentAnnotation);
+          if (canComment && this.onComment) {
             e.preventDefault();
             this.onComment(this.currentAnnotation);
           }
@@ -3176,10 +3301,10 @@
 
     _getTypeLabel(annotationType) {
       const labels = {
-        highlight: "Highlight",
-        line: "Underline",
-        note: "Note",
-        ink: "Drawing"
+        [AnnotationType.HIGHLIGHT]: "Highlight",
+        [AnnotationType.UNDERLINE]: "Underline",
+        [AnnotationType.NOTE]: "Note",
+        [AnnotationType.INK]: "Drawing"
       };
       return labels[annotationType] || "Annotation"
     }
@@ -3208,11 +3333,11 @@
 
       // Show/hide buttons based on annotation type
       const isNote = annotation.annotation_type === "note";
-      const supportsComment = ["highlight", "line", "ink"].includes(annotation.annotation_type);
-      this.commentBtn.classList.toggle("hidden", !supportsComment);
+      const canComment = supportsComment(annotation);
+      this.commentBtn.classList.toggle("hidden", !canComment);
       this.editBtn.classList.toggle("hidden", !isNote);
 
-      if (supportsComment) {
+      if (canComment) {
         const hasComment = annotation.contents && annotation.contents.trim();
         this.commentBtn.title = hasComment ? "Edit Comment (C)" : "Add Comment (C)";
       }
@@ -4034,7 +4159,7 @@
     ink: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
     <path d="M17 3a2.828 2.828 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5L17 3z"/>
   </svg>`,
-    line: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    underline: `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
     <path d="M6 3v7a6 6 0 0 0 6 6 6 6 0 0 0 6-6V3"/>
     <line x1="4" y1="21" x2="20" y2="21" stroke-width="3"/>
   </svg>`
@@ -4321,13 +4446,13 @@
 
       switch (this.filterType) {
         case FilterType.HIGHLIGHT:
-          return type === "highlight" || (type === "ink" && annotation.subject === "Free Highlight")
+          return isHighlightLike(annotation)
         case FilterType.NOTE:
-          return type === "note"
+          return type === AnnotationType.NOTE
         case FilterType.DRAWING:
-          return type === "ink" && annotation.subject !== "Free Highlight"
+          return isDrawing(annotation)
         case FilterType.UNDERLINE:
-          return type === "line"
+          return type === AnnotationType.UNDERLINE
         default:
           return true
       }
@@ -4482,23 +4607,23 @@
       const type = annotation.annotation_type;
       let icon, label, typeLabel;
 
-      if (type === "highlight" || (type === "ink" && annotation.subject === "Free Highlight")) {
+      if (isHighlightLike(annotation)) {
         icon = ANNOTATION_ICONS.highlight;
         typeLabel = "Highlight";
         // Extract highlighted text if available
         label = annotation.title || annotation.contents || "Freehand Highlight";
         label = this._truncate(label, 80);
-      } else if (type === "note") {
+      } else if (type === AnnotationType.NOTE) {
         icon = ANNOTATION_ICONS.note;
         typeLabel = "Note";
         label = annotation.contents || "Empty note";
         label = this._truncate(label, 80);
-      } else if (type === "ink") {
+      } else if (type === AnnotationType.INK) {
         icon = ANNOTATION_ICONS.ink;
         typeLabel = "Drawing";
         label = "Ink drawing";
-      } else if (type === "line") {
-        icon = ANNOTATION_ICONS.line;
+      } else if (type === AnnotationType.UNDERLINE) {
+        icon = ANNOTATION_ICONS.underline;
         typeLabel = "Underline";
         label = annotation.title || "Underlined text";
         label = this._truncate(label, 80);
@@ -4798,6 +4923,17 @@
             // If new matches were added, re-sort and fix current index
             if (this.matches.length > matchCountBefore) {
               this._sortMatchesAndFixIndex();
+
+              // The first search on a document runs before any text has been
+              // extracted, so find() finds nothing and leaves no current match.
+              // Select the first match as soon as one appears; otherwise the UI
+              // sits at "0 of N" with nothing highlighted until the user presses
+              // Next.
+              if (this.currentMatchIndex === -1) {
+                this.currentMatchIndex = 0;
+                this.state = FindState.FOUND;
+                this._scrollToMatch(0);
+              }
             }
 
             this._updateHighlights(pageNum);
@@ -6712,7 +6848,7 @@
         rect: [minX, minY, maxX - minX, maxY - minY],
         color: colorWithAlpha,
         thickness: this.freehandThickness / scale,
-        subject: "Free Highlight"
+        subject: FREE_HIGHLIGHT_SUBJECT
       });
     }
 
@@ -6744,7 +6880,7 @@
 
     async createAnnotationFromSelection(selectedText, pageNumber, quads, rect) {
       await this.annotationManager.createAnnotation({
-        annotation_type: "line",
+        annotation_type: AnnotationType.UNDERLINE,
         page: pageNumber,
         quads: quads,
         rect: rect,
@@ -7648,6 +7784,11 @@
     }
 
     _setupEventListeners() {
+      // _initializeComponents() bails out when .pdf-pages-container is missing,
+      // having logged what the host got wrong. Without this guard the
+      // constructor then throws a TypeError here that buries that message.
+      if (!this.pagesContainer) return
+
       const signal = this._abortController.signal;
 
       // Handle visibility change for time tracking
@@ -7948,15 +8089,14 @@
 
     _onAnnotationEdit(annotation) {
       // For notes, show the edit popup
-      if (annotation.annotation_type === "note") {
+      if (annotation.annotation_type === AnnotationType.NOTE) {
         this.tools[ToolMode.NOTE].editNote(annotation);
       }
     }
 
     _onAnnotationComment(annotation) {
       // For highlight/underline/ink, use the note tool's edit dialog to edit contents
-      const supportsComment = ["highlight", "line", "ink"].includes(annotation.annotation_type);
-      if (supportsComment) {
+      if (supportsComment(annotation)) {
         this.tools[ToolMode.NOTE].editNote(annotation);
       }
     }
@@ -7976,15 +8116,15 @@
 
     /**
      * Get human-readable label for annotation type.
-     * @param {string} type - Annotation type (highlight, note, ink, line)
+     * @param {string} type - Canonical annotation type (see AnnotationType)
      * @returns {string} Human-readable label
      */
     _getAnnotationTypeLabel(type) {
       switch (type) {
-        case "highlight": return "Highlight"
-        case "note": return "Note"
-        case "ink": return "Drawing"
-        case "line": return "Underline"
+        case AnnotationType.HIGHLIGHT: return "Highlight"
+        case AnnotationType.NOTE: return "Note"
+        case AnnotationType.INK: return "Drawing"
+        case AnnotationType.UNDERLINE: return "Underline"
         default: return "Annotation"
       }
     }
@@ -8049,9 +8189,8 @@
 
       // Render each annotation using percentage-based positioning
       for (const annotation of annotations) {
-        const isHighlight = annotation.annotation_type === "highlight" ||
-                           (annotation.annotation_type === "ink" && annotation.subject === "Free Highlight");
-        const isUnderline = annotation.annotation_type === "line";
+        const isHighlight = isHighlightLike(annotation);
+        const isUnderline = annotation.annotation_type === AnnotationType.UNDERLINE;
 
         if (isHighlight) {
           // Render colored SVG in the highlight layer (has mix-blend-mode for text visibility)
@@ -8141,7 +8280,7 @@
     // Render highlight as SVG in the blend layer (for mix-blend-mode to work)
     // Uses unscaled PDF coordinates - SVG viewBox handles scaling
     _renderHighlightSvg(annotation, svgLayer) {
-      if (annotation.annotation_type === "ink") {
+      if (annotation.annotation_type === AnnotationType.INK) {
         this._renderFreehandHighlightSvg(annotation, svgLayer);
         return
       }
@@ -8290,7 +8429,7 @@
       container.className = "annotation annotation-highlight";
       container.dataset.annotationId = annotation.id;
 
-      if (annotation.annotation_type === "ink") {
+      if (annotation.annotation_type === AnnotationType.INK) {
         // Freehand highlight bounds
         const strokes = annotation.ink_strokes || [];
         let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
@@ -8336,11 +8475,11 @@
 
     _createAnnotationElement(annotation, pageWidth, pageHeight) {
       switch (annotation.annotation_type) {
-        case "highlight":
+        case AnnotationType.HIGHLIGHT:
           return this._createHighlightElement(annotation, pageWidth, pageHeight)
-        case "note":
+        case AnnotationType.NOTE:
           return this._createNoteElement(annotation, pageWidth, pageHeight)
-        case "ink":
+        case AnnotationType.INK:
           return this._createInkElement(annotation, pageWidth, pageHeight)
         default:
           return null
@@ -8623,7 +8762,7 @@
     async _onAnnotationColorChange(annotation, color) {
       try {
         // Preserve the existing opacity when changing color (default to 0.4 for highlights/ink, 1 for others)
-        const defaultOpacity = (annotation.annotation_type === "highlight" || annotation.annotation_type === "ink") ? 0.4 : 1;
+        const defaultOpacity = (annotation.annotation_type === AnnotationType.HIGHLIGHT || annotation.annotation_type === AnnotationType.INK) ? 0.4 : 1;
         const opacity = annotation.opacity ?? defaultOpacity;
 
         // Encode opacity into color string as alpha channel (#RRGGBBAA)
