@@ -9,6 +9,8 @@
     - user_name: Current user's name (for watermarks)
     - organization_name: Organization name (for watermarks)
     - initial_page: Page number to open on load
+    - initial_destination: Named destination in the PDF to open at; falls back
+      to initial_page if the document doesn't define it
     - initial_annotation: Annotation ID to highlight on load
     - tracking_url: Endpoint for time tracking (optional)
 %>
@@ -27,6 +29,9 @@
      <% end %>
      <% if local_assigns[:initial_page] %>
        data-pdf-viewer-initial-page-value="<%= initial_page %>"
+     <% end %>
+     <% if local_assigns[:initial_destination] %>
+       data-pdf-viewer-initial-destination-value="<%= initial_destination %>"
      <% end %>
      <% if local_assigns[:initial_annotation] %>
        data-pdf-viewer-initial-annotation-value="<%= initial_annotation %>"

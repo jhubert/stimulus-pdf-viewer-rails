@@ -2,6 +2,34 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.0] - 2026-11-07
+
+### Fixed
+- Updated stimulus-pdf-viewer to 0.7.0
+
+Hyperlinks inside PDFs are now clickable in the viewer. A link written by
+PowerPoint, Keynote, Word or InDesign (a YouTube URL on a slide, a table of
+contents, a "see page 12" reference) used to be drawn on the page but couldn't
+be clicked. Web and email links open in a new tab, and links to other pages
+scroll to the exact spot they target. The PDF file was never altered, which is
+why links always worked in a downloaded copy. See the upstream
+[0.7.0 release notes](https://github.com/jhubert/stimulus-pdf-viewer/releases/tag/v0.7.0)
+for details.
+
+### Added
+- The `initial-destination-value` data attribute, and an `initial_destination`
+  local in the generated viewer partial, open the document at a named
+  destination: an anchor stored in the PDF. If the document doesn't define it,
+  the viewer falls back to `initial-page-value`. Named destinations survive the
+  document being regenerated, so they make better deep links than page numbers.
+- A cancelable `pdf-viewer:link-clicked` event fires before a link in the PDF is
+  followed, so an app can open links itself.
+
+### Upgrade notes
+- The bundled stylesheet gains the `.link-layer` and `.pdf-link` rules that
+  links need. If your app copied the stylesheet instead of importing
+  `stimulus-pdf-viewer` from the gem, copy it again, or links won't be clickable.
+
 ## [0.6.0] - 2026-09-22
 
 ### Fixed
