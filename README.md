@@ -103,6 +103,7 @@ Or if you prefer to vendor the worker locally, copy it to your assets and refere
 | `user-name-value` | User name for watermarks |
 | `organization-name-value` | Organization name for watermarks |
 | `initial-page-value` | Page to open on load |
+| `initial-destination-value` | Named destination in the PDF to open at, falling back to `initial-page-value` if the document doesn't define it. Named destinations survive the document being regenerated, so they make better deep links than page numbers |
 | `initial-annotation-value` | Annotation ID to highlight on load |
 | `tracking-url-value` | Endpoint for time tracking |
 

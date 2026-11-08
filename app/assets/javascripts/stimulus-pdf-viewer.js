@@ -346,6 +346,87 @@
     }
   }
 
+  /**
+   * PDF destinations: where a link, bookmark or named anchor points.
+   *
+   * A destination is either a name, looked up in the document's /Dests or
+   * /Names tree, or an explicit array `[page, {name: type}, ...args]`, where
+   * page is a reference or a 0-based index and the arguments depend on the type
+   * (PDF 32000-1 §12.3.2.2).
+   */
+
+  /**
+   * Resolve a destination to a 1-based page number and, where it names one,
+   * the point on that page to bring to the top-left of the view.
+   *
+   * The zoom some destination types carry is not returned: following a
+   * destination does not change the reader's zoom (see issue #28).
+   *
+   * @param {PDFDocumentProxy} pdfDocument
+   * @param {string|Array} dest - A destination name or an explicit destination
+   * @returns {Promise<{pageNumber: number, point: {x: number|null, y: number|null}|null}|null>}
+   *   null when the name is unknown or the destination points nowhere usable
+   */
+  async function resolveDestination(pdfDocument, dest) {
+    if (!pdfDocument) return null
+
+    const explicit = typeof dest === "string" ? await pdfDocument.getDestination(dest) : dest;
+    if (!Array.isArray(explicit) || explicit.length === 0) return null
+
+    const target = explicit[0];
+    let pageIndex = null;
+    if (Number.isInteger(target)) {
+      pageIndex = target;
+    } else if (target && typeof target === "object") {
+      pageIndex = await pdfDocument.getPageIndex(target);
+    }
+
+    if (!Number.isInteger(pageIndex)) return null
+    const pageNumber = pageIndex + 1;
+    if (pageNumber < 1 || pageNumber > pdfDocument.numPages) return null
+
+    return { pageNumber, point: destinationPoint(explicit) }
+  }
+
+  const coordinate = (value) => (typeof value === "number" && Number.isFinite(value) ? value : null);
+
+  /**
+   * The point an explicit destination asks to be shown at the top-left of the
+   * view, or null when it only names the page (Fit, FitB) or nothing usable.
+   * @param {Array} explicit - `[page, {name}, ...args]`
+   * @returns {{x: number|null, y: number|null}|null}
+   */
+  function destinationPoint(explicit) {
+    const type = explicit[1]?.name ?? explicit[1];
+    const args = explicit.slice(2);
+    let x = null;
+    let y = null;
+
+    switch (type) {
+      case "XYZ":
+        x = coordinate(args[0]);
+        y = coordinate(args[1]);
+        break
+      case "FitH":
+      case "FitBH":
+        y = coordinate(args[0]);
+        break
+      case "FitV":
+      case "FitBV":
+        x = coordinate(args[0]);
+        break
+      case "FitR":
+        // left bottom right top: show the rectangle's top-left
+        x = coordinate(args[0]);
+        y = coordinate(args[3]);
+        break
+      default:
+        return null
+    }
+
+    return x === null && y === null ? null : { x, y }
+  }
+
   // Configure PDF.js worker from meta tag (set by Rails asset pipeline for cache busting)
   const workerSrcMeta = document.querySelector('meta[name="pdf-worker-src"]');
   pdfjsLib__namespace.GlobalWorkerOptions.workerSrc = workerSrcMeta?.content || "/assets/pdfjs-dist--pdf.worker.js";
@@ -407,8 +488,9 @@
       // Page data storage: pageNumber -> PageData
       this.pages = new Map();
 
-      // Pages with an in-flight dimension measurement (dedup for _measurePage)
-      this._measuringPages = new Set();
+      // pageNumber -> in-flight dimension measurement, so _measurePage callers
+      // share one and can wait for it
+      this._measuringPages = new Map();
 
       // Device pixel ratio for high-DPI displays
       this.devicePixelRatio = window.devicePixelRatio || 1;
@@ -675,30 +757,37 @@
 
     /**
      * Load and measure a single page, caching its size and page proxy. No-op if
-     * already measured or a measurement is already in flight for it.
+     * already measured; if a measurement is already in flight, returns that one,
+     * so a caller that needs the size can wait for it.
      * @param {number} pageNum
      * @returns {Promise<void>}
      */
-    async _measurePage(pageNum) {
+    _measurePage(pageNum) {
       const pageData = this.pages.get(pageNum);
-      if (!pageData || pageData.unitViewport || this._measuringPages.has(pageNum)) return
+      if (!pageData || pageData.unitViewport) return Promise.resolve()
 
-      this._measuringPages.add(pageNum);
-      try {
-        const page = await this.pdfDocument.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 1.0, rotation: this._rotationFor(page) });
+      const inFlight = this._measuringPages.get(pageNum);
+      if (inFlight) return inFlight
 
-        // Reuse the loaded page and measured viewport when this page renders.
-        pageData.page = page;
-        pageData.unitViewport = viewport;
-        pageData.container.style.setProperty("--page-width", `${viewport.width}px`);
-        pageData.container.style.setProperty("--page-height", `${viewport.height}px`);
-      } catch (error) {
-        // Leave the provisional size in place if a page can't be measured.
-        console.warn(`Could not measure page ${pageNum}:`, error);
-      } finally {
-        this._measuringPages.delete(pageNum);
-      }
+      const measuring = (async () => {
+        try {
+          const page = await this.pdfDocument.getPage(pageNum);
+          const viewport = page.getViewport({ scale: 1.0, rotation: this._rotationFor(page) });
+
+          // Reuse the loaded page and measured viewport when this page renders.
+          pageData.page = page;
+          pageData.unitViewport = viewport;
+          pageData.container.style.setProperty("--page-width", `${viewport.width}px`);
+          pageData.container.style.setProperty("--page-height", `${viewport.height}px`);
+        } catch (error) {
+          // Leave the provisional size in place if a page can't be measured.
+          console.warn(`Could not measure page ${pageNum}:`, error);
+        } finally {
+          this._measuringPages.delete(pageNum);
+        }
+      })();
+      this._measuringPages.set(pageNum, measuring);
+      return measuring
     }
 
     /**
@@ -823,7 +912,9 @@
         this.eventBus.dispatch(ViewerEvents.PAGE_RENDERED, {
           pageNumber,
           canvas,
-          container
+          container,
+          page,
+          viewport: displayViewport
         });
 
         this.eventBus.dispatch(ViewerEvents.TEXT_LAYER_RENDERED, {
@@ -1112,10 +1203,19 @@
     // ===== Navigation Methods =====
 
     /**
-     * Navigate to a specific page.
+     * Navigate to a specific page, or to a point on it.
+     *
+     * `point` is in PDF user space, as a link destination gives it: `y` is
+     * scrolled to the top of the viewport and `x` to its left edge. Either may be
+     * null, meaning the top of the page and no horizontal change respectively.
+     * Without a point the page's top is scrolled into view with a little room.
+     *
      * @param {number} pageNumber
+     * @param {Object} [options]
+     * @param {{x: number|null, y: number|null}} [options.point]
+     * @returns {Promise<void>} Settles once the scroll has been started
      */
-    goToPage(pageNumber) {
+    async goToPage(pageNumber, { point = null } = {}) {
       // Ensure pageNumber is an integer
       pageNumber = parseInt(pageNumber, 10);
 
@@ -1128,6 +1228,12 @@
         return
       }
 
+      // A point is placed through the page's viewport, which an unvisited page
+      // may not have yet. Measuring also gives its placeholder the true size.
+      if (point && !pageData.unitViewport) {
+        await this._measurePage(pageNumber);
+      }
+
       // Calculate scroll position relative to the scroll container (not the positioned parent)
       // offsetTop is relative to offsetParent which may include toolbar, so we need to
       // calculate relative to the scroll container
@@ -1137,15 +1243,69 @@
       // How far the page currently is from the top of the scroll container
       const pageOffsetFromContainer = pageRect.top - containerRect.top;
 
-      // Add current scroll position to get absolute position, subtract padding for breathing room
-      const targetScrollTop = this.container.scrollTop + pageOffsetFromContainer - 16;
+      const target = point && pageData.unitViewport
+        ? this._pointOnPage(pageData.unitViewport, point)
+        : null;
+
+      let scroll;
+      if (target) {
+        scroll = { top: this.container.scrollTop + pageOffsetFromContainer + target.top };
+        if (target.left !== null) {
+          scroll.left = Math.max(0, this.container.scrollLeft + (pageRect.left - containerRect.left) + target.left);
+        }
+      } else {
+        // Add current scroll position to get absolute position, subtract padding for breathing room
+        scroll = { top: this.container.scrollTop + pageOffsetFromContainer - 16 };
+      }
 
       this.container.scrollTo({
-        top: Math.max(0, targetScrollTop),
+        ...scroll,
+        top: Math.max(0, scroll.top),
         behavior: "smooth"
       });
 
       this.eventBus.dispatch(ViewerEvents.PAGE_CHANGING, { pageNumber });
+    }
+
+    /**
+     * Resolve a destination in the loaded document to a page and point.
+     * @param {string|Array} dest - A destination name or an explicit destination
+     * @returns {Promise<{pageNumber: number, point: Object|null}|null>}
+     */
+    resolveDestination(dest) {
+      return resolveDestination(this.pdfDocument, dest)
+    }
+
+    /**
+     * Scroll to a destination: a named anchor in the PDF (as Word, InDesign or
+     * LaTeX write for headings and bookmarks) or an explicit destination array.
+     * @param {string|Array} dest
+     * @returns {Promise<boolean>} false when the document has no such destination
+     */
+    async goToDestination(dest) {
+      const target = await this.resolveDestination(dest);
+      if (!target) return false
+
+      await this.goToPage(target.pageNumber, target.point ? { point: target.point } : {});
+      return true
+    }
+
+    /**
+     * Convert a PDF user-space point to CSS px from the page's top-left at the
+     * current zoom. The viewport accounts for /Rotate and the crop box offset; a
+     * missing coordinate falls back to the page's top-left corner. Clamped to the
+     * page, since destinations sometimes point past its edge.
+     * @returns {{top: number, left: number|null}}
+     */
+    _pointOnPage(unitViewport, { x = null, y = null }) {
+      const [x0, , , y1] = unitViewport.viewBox;
+      const [vx, vy] = unitViewport.convertToViewportPoint(x ?? x0, y ?? y1);
+      const clamp = (value, max) => Math.min(Math.max(value, 0), max);
+
+      return {
+        top: clamp(vy, unitViewport.height) * this.displayScale,
+        left: x === null ? null : clamp(vx, unitViewport.width) * this.displayScale
+      }
     }
 
     /**
@@ -5928,6 +6088,325 @@
     }
   }
 
+  // Only these schemes are followed from an external link. PDF.js already drops
+  // `javascript:` from `annotation.url`, but it allows others (ftp, tel, ...) and
+  // this is the boundary where a link from an uploaded file becomes clickable.
+  const ALLOWED_PROTOCOLS = new Set(["http:", "https:", "mailto:"]);
+
+  // PDF named actions that move between pages (PDF 32000-1 §12.6.4.11).
+  const NAMED_PAGE_ACTIONS = new Set(["NextPage", "PrevPage", "FirstPage", "LastPage"]);
+
+  // PDF.js AnnotationBorderStyleType -> CSS border-style. Beveled and inset are
+  // 3D effects that CSS's outset and inset approximate.
+  const BORDER_STYLES = { 1: "solid", 2: "dashed", 3: "outset", 4: "inset", 5: "underline" };
+
+  /**
+   * LinkLayer - makes the hyperlinks written into a PDF clickable.
+   *
+   * The page itself is a canvas, so a PDF's Link annotations (a YouTube URL on a
+   * slide, a table of contents, "see page 12") are otherwise just pixels. For
+   * each rendered page this reads the Link annotations out of the PDF and lays an
+   * <a> over each one.
+   *
+   * Links are positioned in percentages of the page, like Boardwise annotations,
+   * so they follow zoom without being re-placed. The layer sits above the text
+   * layer, so links win over text selection where they overlap, and below
+   * `.annotation-layer`, so the viewer's own highlights and notes keep priority.
+   */
+  class LinkLayer {
+    /**
+     * @param {Object} options
+     * @param {CoreViewer} options.viewer - Supplies pdfDocument, resolveDestination, goToPage and the page count
+     * @param {EventBus} options.eventBus - ANNOTATION_LAYER_RENDERED is dispatched here
+     * @param {Function} [options.onGoToPage] - `(pageNumber, { point })` follows an
+     *   internal link; defaults to viewer.goToPage
+     * @param {Function} [options.onLinkClick] - Called with `{ kind: "external", url }`
+     *   or `{ kind: "internal", pageNumber }` before a link is followed; return
+     *   false to stop it
+     */
+    constructor({ viewer, eventBus, onGoToPage, onLinkClick }) {
+      this.viewer = viewer;
+      this.eventBus = eventBus;
+      this._goToPage = onGoToPage || ((pageNumber, options) => this.viewer.goToPage(pageNumber, options));
+      this._onLinkClick = onLinkClick || (() => true);
+
+      // pageNumber -> Promise<Array<link>>. Links don't change between renders of
+      // the same document, so a zoom re-render rebuilds the DOM without asking
+      // PDF.js again. Keyed to the document so a reload starts fresh.
+      this._links = new Map();
+      this._linksDocument = null;
+    }
+
+    /**
+     * Build the link layer for a page that has just been drawn.
+     * @param {number} pageNumber
+     * @param {HTMLElement} pageContainer - The `.pdf-page` element
+     * @param {PDFPageProxy} page
+     * @param {PageViewport} viewport - The viewport the page was rendered at
+     * @returns {Promise<HTMLElement|null>} The layer, or null when the page has no links
+     */
+    async renderPage(pageNumber, pageContainer, page, viewport) {
+      const pdfDocument = this.viewer.pdfDocument;
+      if (!pageContainer || !page || !viewport || !pdfDocument) return null
+
+      let links;
+      try {
+        links = await this._linksFor(pageNumber, page, viewport, pdfDocument);
+      } catch (error) {
+        // A malformed annotation dictionary costs the page its links, not its render.
+        console.warn(`Could not read links on page ${pageNumber}:`, error);
+        links = [];
+      }
+
+      // The document was replaced or the page torn down while PDF.js was reading.
+      if (this.viewer.pdfDocument !== pdfDocument || !pageContainer.isConnected) return null
+
+      pageContainer.querySelectorAll(":scope > .link-layer").forEach(layer => layer.remove());
+
+      let layer = null;
+      if (links.length > 0) {
+        layer = document.createElement("div");
+        layer.className = "link-layer";
+        for (const link of links) {
+          layer.appendChild(this._createLinkElement(link));
+        }
+
+        // Directly above the text layer. `.annotation-layer` is appended to the
+        // end of the page, so it stays above us whichever is built first.
+        const textLayer = pageContainer.querySelector(":scope > .textLayer");
+        const annotationLayer = pageContainer.querySelector(":scope > .annotation-layer");
+        if (textLayer) {
+          textLayer.after(layer);
+        } else if (annotationLayer) {
+          annotationLayer.before(layer);
+        } else {
+          pageContainer.appendChild(layer);
+        }
+      }
+
+      this.eventBus.dispatch(ViewerEvents.ANNOTATION_LAYER_RENDERED, {
+        pageNumber,
+        layer,
+        linkCount: links.length
+      });
+
+      return layer
+    }
+
+    destroy() {
+      this._links.clear();
+      this._linksDocument = null;
+    }
+
+    _linksFor(pageNumber, page, viewport, pdfDocument) {
+      if (this._linksDocument !== pdfDocument) {
+        this._links.clear();
+        this._linksDocument = pdfDocument;
+      }
+
+      if (!this._links.has(pageNumber)) {
+        const pending = page.getAnnotations({ intent: "display" })
+          .then(annotations => this._extractLinks(annotations, viewport));
+        // Don't cache a failure: the next render of this page gets another try.
+        pending.catch(() => this._links.delete(pageNumber));
+        this._links.set(pageNumber, pending);
+      }
+
+      return this._links.get(pageNumber)
+    }
+
+    /**
+     * Reduce PDF.js annotation data to the links we can follow, with their
+     * position as fractions of the page.
+     */
+    _extractLinks(annotations, viewport) {
+      const links = [];
+
+      for (const annotation of annotations || []) {
+        if (annotation.subtype !== "Link" || !Array.isArray(annotation.rect)) continue
+
+        const target = this._targetFor(annotation);
+        if (!target) continue
+
+        const box = this._boxFor(annotation.rect, viewport);
+        if (!box) continue
+
+        links.push({ ...target, ...box, border: this._borderFor(annotation) });
+      }
+
+      return links
+    }
+
+    _targetFor(annotation) {
+      if (annotation.url) {
+        const url = safeExternalUrl(annotation.url);
+        return url ? { kind: "external", url } : null
+      }
+
+      if (annotation.dest) {
+        return { kind: "internal", dest: annotation.dest }
+      }
+
+      if (NAMED_PAGE_ACTIONS.has(annotation.action)) {
+        return { kind: "action", action: annotation.action }
+      }
+
+      // Launch, embedded-file, JavaScript, SubmitForm and other actions are
+      // deliberately not followed.
+      return null
+    }
+
+    /**
+     * Annotation rects are in PDF user space. The viewport maps them onto the
+     * rendered page, accounting for the page's /Rotate and its crop box offset.
+     */
+    _boxFor(rect, viewport) {
+      if (!viewport.width || !viewport.height) return null
+
+      const [x1, y1, x2, y2] = viewport.convertToViewportRectangle(rect);
+      const left = Math.min(x1, x2);
+      const top = Math.min(y1, y2);
+      const width = Math.abs(x2 - x1);
+      const height = Math.abs(y2 - y1);
+      if (width <= 0 || height <= 0) return null
+
+      return {
+        left: left / viewport.width,
+        top: top / viewport.height,
+        width: width / viewport.width,
+        height: height / viewport.height
+      }
+    }
+
+    /**
+     * The border the PDF asks to be drawn around the link, as Acrobat draws it,
+     * or null. Follows PDF.js's reading of the dictionary: a link with no
+     * /Border or /BS has width 0, and an empty /C means transparent, so the
+     * borderless links PowerPoint and Word write stay invisible while LaTeX's
+     * boxed links keep their boxes.
+     */
+    _borderFor(annotation) {
+      const { width, style, horizontalCornerRadius = 0, verticalCornerRadius = 0 } = annotation.borderStyle || {};
+      const color = annotation.borderColor || annotation.color;
+      if (!(width > 0) || !color || color.length < 3) return null
+
+      const [r, g, b] = Array.from(color, c => c | 0);
+      return {
+        width,
+        style: BORDER_STYLES[style] || "solid",
+        color: `rgb(${r}, ${g}, ${b})`,
+        radius: [horizontalCornerRadius, verticalCornerRadius]
+      }
+    }
+
+    /**
+     * Border measurements are in PDF points, so they scale with --display-scale
+     * like the page does.
+     */
+    _applyBorder(element, border) {
+      const points = (n) => `calc(${n}px * var(--display-scale, 1))`;
+      const style = element.style;
+
+      if (border.style === "underline") {
+        style.borderBottomWidth = points(border.width);
+        style.borderBottomStyle = "solid";
+        style.borderBottomColor = border.color;
+      } else {
+        style.borderWidth = points(border.width);
+        style.borderStyle = border.style;
+        style.borderColor = border.color;
+      }
+
+      const [horizontal, vertical] = border.radius;
+      if (horizontal > 0 || vertical > 0) {
+        style.borderRadius = `${points(horizontal)} / ${points(vertical)}`;
+      }
+      element.classList.add("pdf-link--bordered");
+    }
+
+    _createLinkElement(link) {
+      const a = document.createElement("a");
+      a.className = "pdf-link";
+      a.style.left = `${link.left * 100}%`;
+      a.style.top = `${link.top * 100}%`;
+      a.style.width = `${link.width * 100}%`;
+      a.style.height = `${link.height * 100}%`;
+      // Dragging a link would otherwise start a link drag rather than nothing.
+      a.draggable = false;
+      if (link.border) this._applyBorder(a, link.border);
+
+      if (link.kind === "external") {
+        a.href = link.url;
+        a.target = "_blank";
+        a.rel = "noopener noreferrer";
+        a.title = link.url.replace(/^mailto:/i, "");
+        a.dataset.linkKind = "external";
+        a.addEventListener("click", (event) => {
+          // The anchor opens the URL itself; a host that handles it (a native
+          // app's web view, say) cancels that here.
+          if (this._onLinkClick({ kind: "external", url: link.url }) === false) {
+            event.preventDefault();
+          }
+        });
+      } else {
+        // A real href keeps the link focusable and announced as a link; the click
+        // handler scrolls the viewer instead of navigating.
+        a.href = "#";
+        a.dataset.linkKind = "internal";
+        a.setAttribute("aria-label", "Go to linked page");
+        a.addEventListener("click", (event) => {
+          event.preventDefault();
+          this._followInternal(link);
+        });
+        // Middle-click would otherwise open "#" in a new tab.
+        a.addEventListener("auxclick", (event) => event.preventDefault());
+      }
+
+      return a
+    }
+
+    async _followInternal(link) {
+      try {
+        const target = link.kind === "action"
+          ? { pageNumber: this._pageForAction(link.action), point: null }
+          : await this.viewer.resolveDestination(link.dest);
+        if (!target?.pageNumber) return
+        if (this._onLinkClick({ kind: "internal", pageNumber: target.pageNumber }) === false) return
+
+        this._goToPage(target.pageNumber, target.point ? { point: target.point } : {});
+      } catch (error) {
+        console.warn("Could not follow PDF link:", error);
+      }
+    }
+
+    _pageForAction(action) {
+      const current = this.viewer.getCurrentPage();
+      const count = this.viewer.getPageCount();
+      switch (action) {
+        case "NextPage": return Math.min(current + 1, count)
+        case "PrevPage": return Math.max(current - 1, 1)
+        case "FirstPage": return 1
+        case "LastPage": return count
+        default: return null
+      }
+    }
+  }
+
+  /**
+   * Return the URL if it is absolute and uses an allowed scheme, else null.
+   * @param {string} url
+   * @returns {string|null}
+   */
+  function safeExternalUrl(url) {
+    if (typeof url !== "string") return null
+    try {
+      const parsed = new URL(url);
+      return ALLOWED_PROTOCOLS.has(parsed.protocol) ? parsed.href : null
+    } catch {
+      return null
+    }
+  }
+
   class BaseTool {
     constructor(pdfViewer) {
       this.pdfViewer = pdfViewer;
@@ -7549,6 +8028,7 @@
       this.userName = options.userName;
       this.documentId = options.documentId;
       this.initialPage = options.initialPage || 1;
+      this.initialDestination = options.initialDestination;
       this.initialAnnotation = options.initialAnnotation;
 
       this.currentTool = null;
@@ -7604,6 +8084,14 @@
       this.viewer = new CoreViewer(this.pagesContainer, {
         initialScale: 1.0,
         onPasswordRequest: ({ retry }) => this.passwordPrompt.request({ retry })
+      });
+
+      // Makes the hyperlinks written into the PDF itself clickable
+      this.linkLayer = new LinkLayer({
+        viewer: this.viewer,
+        eventBus: this.viewer.eventBus,
+        onGoToPage: (pageNumber, options) => this.goToPage(pageNumber, options),
+        onLinkClick: (detail) => this._onLinkClick(detail)
       });
 
       // Subscribe to core viewer events
@@ -7721,8 +8209,9 @@
       });
 
       // Page rendered - apply watermark and render annotations
-      eventBus.on(ViewerEvents.PAGE_RENDERED, ({ pageNumber, canvas, container }) => {
+      eventBus.on(ViewerEvents.PAGE_RENDERED, ({ pageNumber, canvas, container, page, viewport }) => {
         this._onPageRendered(pageNumber, canvas, container);
+        this.linkLayer.renderPage(pageNumber, container, page, viewport);
       });
 
       // Text layer ready - notify tools and find controller
@@ -7866,8 +8355,13 @@
           detail: { annotations, count: annotations.length }
         }));
 
-        // Navigate to initial page if specified
-        if (this.initialPage > 1) {
+        // Open at the initial destination if specified, falling back to the
+        // initial page when the document has no such destination (a stale
+        // link, or an older copy of the document without the anchor)
+        const openedAtDestination = this.initialDestination
+          ? await this.goToDestination(this.initialDestination)
+          : false;
+        if (!openedAtDestination && this.initialPage > 1) {
           this.viewer.goToPage(this.initialPage);
         }
 
@@ -7970,10 +8464,35 @@
      * Navigate to a specific page.
      * @param {number} pageNumber
      */
-    goToPage(pageNumber) {
-      this.viewer?.goToPage(pageNumber);
+    goToPage(pageNumber, options = {}) {
+      this.viewer?.goToPage(pageNumber, options);
       // Check and dispatch page change event
       this._checkPageChange();
+    }
+
+    /**
+     * Scroll to a named destination in the PDF (or an explicit destination
+     * array). Named destinations survive the document being regenerated, so
+     * they make better deep links than page numbers.
+     * @param {string|Array} dest
+     * @returns {Promise<boolean>} false when the document has no such destination
+     */
+    async goToDestination(dest) {
+      if (!this.viewer) return false
+      let found = false;
+      try {
+        found = await this.viewer.goToDestination(dest);
+      } catch (error) {
+        console.warn("[PdfViewer] Could not resolve destination:", error);
+        return false
+      }
+
+      if (found) {
+        this._checkPageChange();
+      } else {
+        console.warn(`[PdfViewer] No destination ${JSON.stringify(dest)} in this document`);
+      }
+      return found
     }
 
     // Page rendering callbacks
@@ -7984,6 +8503,21 @@
 
       // Render annotations for this page
       this._renderAnnotationsForPage(pageNumber, pageContainer);
+    }
+
+    /**
+     * Announce a click on a link inside the PDF. Cancelable: a host that calls
+     * preventDefault() on `pdf-viewer:link-clicked` takes over, and the viewer
+     * neither opens the URL nor scrolls.
+     * @returns {boolean} Whether the viewer should follow the link
+     */
+    _onLinkClick(detail) {
+      const event = new CustomEvent("pdf-viewer:link-clicked", {
+        bubbles: true,
+        cancelable: true,
+        detail
+      });
+      return this.container.dispatchEvent(event)
     }
 
     _onTextLayerRendered(pageNumber, textLayer) {
@@ -8932,6 +9466,7 @@
       this.findBar?.destroy();
       this.colorPicker?.destroy();
       this.passwordPrompt?.destroy();
+      this.linkLayer?.destroy();
 
       Object.values(this.tools || {}).forEach(tool => tool.destroy?.());
 
@@ -8952,6 +9487,7 @@
       documentId: String,
       trackingUrl: String,
       initialPage: Number,
+      initialDestination: String,
       initialAnnotation: String,
       autoHeight: { type: Boolean, default: true },
       detailPanel: { type: Boolean, default: false },
@@ -8976,6 +9512,7 @@
         userName: this.userNameValue,
         documentId: this.documentIdValue,
         initialPage: this.initialPageValue || 1,
+        initialDestination: this.initialDestinationValue || null,
         initialAnnotation: this.initialAnnotationValue,
         detailPanel: this.detailPanelValue
       });
