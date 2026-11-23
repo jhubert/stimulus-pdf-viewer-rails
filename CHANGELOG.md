@@ -2,6 +2,40 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.7.1] - 2026-11-22
+
+### Fixed
+- Updated stimulus-pdf-viewer to 0.7.1
+
+A bugfix release with no new attributes or stylesheet changes.
+
+- Drawing: a quick pen stroke on another page no longer throws from
+  `setPointerCapture` (Apple Pencil), ink drawn just before leaving a document
+  is saved, and a palm or second finger no longer corrupts a stroke in progress.
+- Annotated downloads no longer fail for readers whose name is outside Latin-1
+  ("Łukasz", "山田"), and annotations land where they were drawn on rotated and
+  cropped pages. A download whose fetch fails now reports an error instead of
+  saving the error response.
+- Time tracking no longer counts time while the tab is hidden.
+- Leaving a page while the viewer is still loading no longer leaves it running
+  or shows "Failed to load PDF document".
+- Ctrl/Cmd+Z undoes a deletion while the undo bar is showing, and undo works
+  when no `annotations-url-value` is set.
+- A note that fails to save keeps its dialog open, so the text isn't lost.
+- The colour picker's dropdown stays inside the viewer, so its last colours can
+  be clicked when the picker sits near the right of the toolbar.
+
+See the upstream
+[0.7.1 release notes](https://github.com/jhubert/stimulus-pdf-viewer/releases/tag/v0.7.1)
+for details.
+
+### Upgrade notes
+- A failure to load annotations no longer covers the document with "Failed to
+  load PDF document". The document stays readable and the failure is reported
+  through the `pdf-viewer:error` event, as before. An app calling
+  `PdfViewer#load` itself and relying on it rejecting should listen for that
+  event.
+
 ## [0.7.0] - 2026-11-07
 
 ### Fixed

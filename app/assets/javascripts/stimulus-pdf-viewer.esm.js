@@ -1,7 +1,7 @@
 import { Controller } from '@hotwired/stimulus';
 import * as pdfjsLib from 'pdfjs-dist';
 import { FetchRequest } from '@rails/request.js';
-import { PDFDocument, StandardFonts, degrees, rgb, PDFName, PDFArray, PDFString, PDFHexString } from 'pdf-lib';
+import { PDFDocument, StandardFonts, PDFName, PDFArray, PDFHexString, PDFString, degrees, rgb } from 'pdf-lib';
 
 /**
  * EventBus - Internal event system for the PDF viewer.
@@ -531,6 +531,10 @@ class CoreViewer {
     try {
       return await this._loadDocument(url)
     } catch (error) {
+      // destroy() aborts a load in progress, which rejects here. Retrying
+      // would fetch the whole file and build a document nothing will release.
+      if (this._destroyed) throw error
+
       if (typeof url === "string" && this._shouldRetryAsBlob(error)) {
         console.warn("PDF streamed load failed, retrying as full fetch:", error);
         try {
@@ -1582,6 +1586,8 @@ class CoreViewer {
   }
 
   destroy() {
+    this._destroyed = true;
+
     // Remove every listener registered with the abort signal (scroll, pinch,
     // per-text-layer, and the global document/window selection listeners).
     this._abortController.abort();
@@ -1801,6 +1807,7 @@ class MemoryAnnotationStore extends AnnotationStore {
   constructor() {
     super();
     this._annotations = [];
+    this._deleted = new Map(); // id -> annotation, so a delete can be undone
     this._nextId = 1;
   }
 
@@ -1844,13 +1851,21 @@ class MemoryAnnotationStore extends AnnotationStore {
     }
 
     const [annotation] = this._annotations.splice(index, 1);
+    this._deleted.set(id, annotation);
     return annotation
   }
 
+  /**
+   * Put back an annotation removed by delete().
+   * @returns {Promise<Object|null>} The annotation, or null if it was never deleted
+   */
   async restore(id) {
-    // Memory store doesn't support soft-delete/restore
-    console.warn("MemoryAnnotationStore.restore() is not supported");
-    return null
+    const annotation = this._deleted.get(id);
+    if (!annotation) return null
+
+    this._deleted.delete(id);
+    this._annotations.push(annotation);
+    return annotation
   }
 }
 
@@ -2265,9 +2280,7 @@ class DownloadManager {
     this._extGStateCache.clear();
 
     // Fetch original PDF using Rails request.js for consistent CSRF handling
-    const request = new FetchRequest("get", this.documentUrl, { responseKind: "blob" });
-    const response = await request.perform();
-    const existingPdfBytes = await response.response.arrayBuffer();
+    const existingPdfBytes = await this._fetchDocument();
     const pdfDoc = await PDFDocument.load(existingPdfBytes);
 
     // Set document metadata
@@ -2276,22 +2289,22 @@ class DownloadManager {
     // Get all annotations
     const annotations = this.annotationManager.getAllAnnotations();
 
-    // Embed font for watermark
-    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    // Embed what the watermark is drawn with (a font, or an image of the name)
+    const watermark = await this._prepareWatermark(pdfDoc);
 
     // Process each page
     const pages = pdfDoc.getPages();
     for (let i = 0; i < pages.length; i++) {
       const page = pages[i];
       const pageNumber = i + 1;
-      const { width, height } = page.getSize();
+      const geometry = this._pageGeometry(page);
 
       // Apply watermark
-      this._applyWatermarkToPage(page, font, width, height);
+      this._applyWatermarkToPage(page, watermark, geometry);
 
       // Apply annotations for this page
       const pageAnnotations = annotations.filter(a => a.page === pageNumber);
-      this._applyAnnotationsToPage(pdfDoc, page, pageAnnotations, height);
+      this._applyAnnotationsToPage(pdfDoc, page, pageAnnotations, geometry);
     }
 
     // Save and download
@@ -2303,59 +2316,221 @@ class DownloadManager {
   // Download the original file untouched. Used for encrypted documents, which
   // pdf-lib can't open to embed annotations or the watermark.
   async downloadOriginal() {
-    const request = new FetchRequest("get", this.documentUrl, { responseKind: "blob" });
-    const response = await request.perform();
-    const pdfBytes = await response.response.arrayBuffer();
+    const pdfBytes = await this._fetchDocument();
+
+    // The bytes are saved as they arrive, so make sure they are a PDF. An
+    // expired session typically answers 200 with a login page, which would
+    // otherwise be saved under the document's name.
+    if (!this._looksLikePdf(pdfBytes)) {
+      throw new Error("The server did not return a PDF")
+    }
+
     const filename = this._sanitizeFilename(this.documentName || "document");
     this._triggerDownload(pdfBytes, filename);
   }
 
-  _applyWatermarkToPage(page, font, width, height) {
-    if (!this.userName) return
-
-    // Diagonal watermark
-    page.drawText(this.userName, {
-      x: width / 2 - 50,
-      y: height / 2,
-      size: 25,
-      font: font,
-      color: rgb(0, 0, 0),
-      opacity: 0.07,
-      rotate: degrees(-45)
-    });
-
-    // Header watermark
-    const textWidth = font.widthOfTextAtSize(this.userName, 6);
-    page.drawText(this.userName, {
-      x: (width - textWidth) / 2,
-      y: height - 10,
-      size: 6,
-      font: font,
-      color: rgb(0, 0, 0),
-      opacity: 0.10
-    });
+  // Fetch the original PDF using Rails request.js for consistent CSRF handling
+  async _fetchDocument() {
+    const request = new FetchRequest("get", this.documentUrl, { responseKind: "blob" });
+    const response = await request.perform();
+    if (!response.ok) {
+      throw new Error(`Failed to fetch PDF (HTTP ${response.statusCode})`)
+    }
+    return response.response.arrayBuffer()
   }
 
-  _applyAnnotationsToPage(pdfDoc, page, annotations, pageHeight) {
+  // The spec allows the %PDF- header anywhere in the first 1024 bytes
+  _looksLikePdf(bytes) {
+    const head = new Uint8Array(bytes).subarray(0, 1024);
+    const marker = [0x25, 0x50, 0x44, 0x46, 0x2d]; // %PDF-
+    for (let i = 0; i <= head.length - marker.length; i++) {
+      if (marker.every((byte, j) => head[i + j] === byte)) return true
+    }
+    return false
+  }
+
+  /**
+   * How a page is displayed, and how to get from displayed coordinates back
+   * to the PDF's own.
+   *
+   * Annotations are stored as the viewer shows the page: origin at the top
+   * left of the visible (crop) box, after the page's /Rotate is applied. PDF
+   * user space is unrotated with its origin at the bottom left, wherever the
+   * media box puts it. For an upright page whose boxes start at 0,0 the two
+   * differ only by a y flip; for a rotated or cropped page they do not, and
+   * annotations written with only the flip land off the page.
+   *
+   * @returns {{width: number, height: number, rotation: number, toPdf: (x: number, y: number) => number[]}}
+   *   `width`/`height` are the displayed size; `toPdf` maps a displayed point
+   *   to user space.
+   */
+  _pageGeometry(page) {
+    // PDF.js displays the crop box clipped to the media box
+    const media = page.getMediaBox();
+    const crop = page.getCropBox();
+    let x0 = Math.max(crop.x, media.x);
+    let y0 = Math.max(crop.y, media.y);
+    let x1 = Math.min(crop.x + crop.width, media.x + media.width);
+    let y1 = Math.min(crop.y + crop.height, media.y + media.height);
+    if (x1 <= x0 || y1 <= y0) {
+      x0 = media.x;
+      y0 = media.y;
+      x1 = media.x + media.width;
+      y1 = media.y + media.height;
+    }
+
+    const rotation = ((page.getRotation().angle % 360) + 360) % 360;
+    const sideways = rotation === 90 || rotation === 270;
+
+    const toPdf = (x, y) => {
+      switch (rotation) {
+        case 90: return [x0 + y, y0 + x]
+        case 180: return [x1 - x, y0 + y]
+        case 270: return [x1 - y, y1 - x]
+        default: return [x0 + x, y1 - y]
+      }
+    };
+
+    return {
+      width: sideways ? y1 - y0 : x1 - x0,
+      height: sideways ? x1 - x0 : y1 - y0,
+      rotation,
+      toPdf
+    }
+  }
+
+  /**
+   * Decide how the watermark will be drawn, once per download.
+   *
+   * The standard Helvetica font only covers WinAnsi (roughly Latin-1), and
+   * pdf-lib throws on anything else, which used to fail the whole download
+   * for a reader named "Łukasz" or "山田". Such names are drawn by the browser
+   * onto a canvas and embedded as an image instead. Where no canvas is
+   * available the characters Helvetica lacks are dropped, so the download
+   * still succeeds.
+   *
+   * @returns {Promise<{font: Object, text: string}|{image: Object, descent: number}|null>}
+   */
+  async _prepareWatermark(pdfDoc) {
+    if (!this.userName) return null
+
+    const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
+    if (this._canEncode(font, this.userName)) {
+      return { font, text: this.userName }
+    }
+
+    const rendered = this._renderTextPng(this.userName);
+    if (rendered) {
+      try {
+        return { image: await pdfDoc.embedPng(rendered.png), descent: rendered.descent }
+      } catch (error) {
+        console.warn("[DownloadManager] Could not embed the watermark image:", error);
+      }
+    }
+
+    const text = Array.from(this.userName).filter(char => this._canEncode(font, char)).join("").trim();
+    if (!text) {
+      console.warn("[DownloadManager] Watermark omitted: the user name cannot be drawn");
+      return null
+    }
+    return { font, text }
+  }
+
+  _canEncode(font, text) {
+    try {
+      font.encodeText(text);
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Draw text to a PNG with the browser's own fonts, which cover scripts the
+   * PDF standard fonts do not.
+   * @returns {{png: string, descent: number}|null} A PNG data URI, and the
+   *   share of the image height that sits below the text baseline. null when
+   *   the canvas can't produce one.
+   */
+  _renderTextPng(text) {
+    try {
+      const fontPx = 96;
+      const font = `${fontPx}px sans-serif`;
+      const descent = 0.25;
+      const canvas = document.createElement("canvas");
+      const context = canvas.getContext("2d");
+      if (!context?.measureText) return null
+
+      context.font = font;
+      const width = Math.ceil(context.measureText(text).width);
+      if (!width) return null
+
+      // Sizing a canvas resets its context, so the font is set again
+      canvas.width = width;
+      canvas.height = Math.ceil(fontPx / (1 - descent));
+      context.font = font;
+      context.fillStyle = "#000";
+      context.textBaseline = "alphabetic";
+      context.fillText(text, 0, fontPx);
+
+      const png = canvas.toDataURL("image/png");
+      return png.startsWith("data:image/png") ? { png, descent } : null
+    } catch {
+      return null
+    }
+  }
+
+  _applyWatermarkToPage(page, watermark, geometry) {
+    if (!watermark) return
+
+    // Positions are given as the page is displayed and angles are offset by
+    // the page's rotation, so the watermark reads the same on a rotated page
+    const { width, height, rotation, toPdf } = geometry;
+    const draw = ({ x, y, size, opacity, angle, centered = false }) => {
+      const rotate = degrees(angle + rotation);
+
+      if (watermark.image) {
+        // Scale the image so its text matches `size`, and sit it so the
+        // text's baseline is at y
+        const imageHeight = size / (1 - watermark.descent);
+        const imageWidth = imageHeight * (watermark.image.width / watermark.image.height);
+        const left = centered ? (width - imageWidth) / 2 : x;
+        const [pdfX, pdfY] = toPdf(left, y + imageHeight * watermark.descent);
+        page.drawImage(watermark.image, { x: pdfX, y: pdfY, width: imageWidth, height: imageHeight, opacity, rotate });
+      } else {
+        const left = centered ? (width - watermark.font.widthOfTextAtSize(watermark.text, size)) / 2 : x;
+        const [pdfX, pdfY] = toPdf(left, y);
+        page.drawText(watermark.text, { x: pdfX, y: pdfY, size, font: watermark.font, color: rgb(0, 0, 0), opacity, rotate });
+      }
+    };
+
+    // Diagonal watermark
+    draw({ x: width / 2 - 50, y: height / 2, size: 25, opacity: 0.07, angle: -45 });
+
+    // Header watermark
+    draw({ y: 10, size: 6, opacity: 0.10, angle: 0, centered: true });
+  }
+
+  _applyAnnotationsToPage(pdfDoc, page, annotations, geometry) {
     for (const annotation of annotations) {
       switch (annotation.annotation_type) {
         case AnnotationType.HIGHLIGHT:
-          this._applyHighlight(pdfDoc, page, annotation, pageHeight);
+          this._applyHighlight(pdfDoc, page, annotation, geometry);
           break
         case AnnotationType.UNDERLINE:
-          this._applyUnderline(pdfDoc, page, annotation, pageHeight);
+          this._applyUnderline(pdfDoc, page, annotation, geometry);
           break
         case AnnotationType.INK:
-          this._applyInk(pdfDoc, page, annotation, pageHeight);
+          this._applyInk(pdfDoc, page, annotation, geometry);
           break
         case AnnotationType.NOTE:
-          this._applyNote(pdfDoc, page, annotation, pageHeight);
+          this._applyNote(pdfDoc, page, annotation, geometry);
           break
       }
     }
   }
 
-  _applyHighlight(pdfDoc, page, annotation, pageHeight) {
+  _applyHighlight(pdfDoc, page, annotation, geometry) {
     const { quads, color } = annotation;
     if (!quads || quads.length === 0) return
 
@@ -2367,12 +2542,12 @@ class DownloadManager {
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
 
     for (const quad of quads) {
-      // Convert from top-left origin to bottom-left
+      // Convert from displayed coordinates to PDF user space
       const points = [
-        quad.p3.x, pageHeight - quad.p3.y, // bottom-left
-        quad.p4.x, pageHeight - quad.p4.y, // bottom-right
-        quad.p2.x, pageHeight - quad.p2.y, // top-right
-        quad.p1.x, pageHeight - quad.p1.y, // top-left
+        ...geometry.toPdf(quad.p3.x, quad.p3.y), // bottom-left
+        ...geometry.toPdf(quad.p4.x, quad.p4.y), // bottom-right
+        ...geometry.toPdf(quad.p2.x, quad.p2.y), // top-right
+        ...geometry.toPdf(quad.p1.x, quad.p1.y), // top-left
       ];
       quadPoints.push(...points);
 
@@ -2399,7 +2574,7 @@ class DownloadManager {
     this._addAnnotationToPage(pdfDoc, page, annotationDict);
   }
 
-  _applyUnderline(pdfDoc, page, annotation, pageHeight) {
+  _applyUnderline(pdfDoc, page, annotation, geometry) {
     const { quads, color } = annotation;
     if (!quads || quads.length === 0) return
 
@@ -2411,10 +2586,10 @@ class DownloadManager {
 
     for (const quad of quads) {
       const points = [
-        quad.p3.x, pageHeight - quad.p3.y,
-        quad.p4.x, pageHeight - quad.p4.y,
-        quad.p2.x, pageHeight - quad.p2.y,
-        quad.p1.x, pageHeight - quad.p1.y,
+        ...geometry.toPdf(quad.p3.x, quad.p3.y),
+        ...geometry.toPdf(quad.p4.x, quad.p4.y),
+        ...geometry.toPdf(quad.p2.x, quad.p2.y),
+        ...geometry.toPdf(quad.p1.x, quad.p1.y),
       ];
       quadPoints.push(...points);
 
@@ -2439,10 +2614,10 @@ class DownloadManager {
     this._addAnnotationToPage(pdfDoc, page, annotationDict);
   }
 
-  _applyInk(pdfDoc, page, annotation, pageHeight) {
+  _applyInk(pdfDoc, page, annotation, geometry) {
     // Freehand highlights need different rendering (thick, semi-transparent strokes)
     if (isFreeHighlight(annotation)) {
-      this._applyFreehandHighlight(pdfDoc, page, annotation, pageHeight);
+      this._applyFreehandHighlight(pdfDoc, page, annotation, geometry);
       return
     }
 
@@ -2462,8 +2637,7 @@ class DownloadManager {
 
       const pathPoints = [];
       for (const point of points) {
-        const pdfX = point.x;
-        const pdfY = pageHeight - point.y;
+        const [pdfX, pdfY] = geometry.toPdf(point.x, point.y);
         pathPoints.push(pdfX, pdfY);
 
         minX = Math.min(minX, pdfX);
@@ -2526,7 +2700,7 @@ class DownloadManager {
     this._addAnnotationToPage(pdfDoc, page, annotationDict);
   }
 
-  _applyFreehandHighlight(pdfDoc, page, annotation, pageHeight) {
+  _applyFreehandHighlight(pdfDoc, page, annotation, geometry) {
     const { ink_strokes, color } = annotation;
     if (!ink_strokes || ink_strokes.length === 0) return
 
@@ -2544,8 +2718,7 @@ class DownloadManager {
 
       const pathPoints = [];
       for (const point of points) {
-        const pdfX = point.x;
-        const pdfY = pageHeight - point.y;
+        const [pdfX, pdfY] = geometry.toPdf(point.x, point.y);
         pathPoints.push({ x: pdfX, y: pdfY });
 
         minX = Math.min(minX, pdfX);
@@ -2623,20 +2796,23 @@ class DownloadManager {
     this._addAnnotationToPage(pdfDoc, page, annotationDict);
   }
 
-  _applyNote(pdfDoc, page, annotation, pageHeight) {
+  _applyNote(pdfDoc, page, annotation, geometry) {
     const { rect, contents, color } = annotation;
     if (!rect || !contents) return
 
     const rgba = this._parseColor(color);
     const [x, y] = rect;
-    // Convert from top-left origin to bottom-left (PDF uses bottom-left)
-    const pdfY = pageHeight - y;
     const iconSize = 24;
+
+    // The icon's box as displayed, converted corner by corner so it stays a
+    // well-formed Rect whichever way the page is rotated
+    const [ax, ay] = geometry.toPdf(x, y);
+    const [bx, by] = geometry.toPdf(x + iconSize, y + iconSize);
 
     const annotationDict = pdfDoc.context.obj({
       Type: PDFName.of("Annot"),
       Subtype: PDFName.of(PDF_SUBTYPES[AnnotationType.NOTE]),
-      Rect: [x, pdfY - iconSize, x + iconSize, pdfY],
+      Rect: [Math.min(ax, bx), Math.min(ay, by), Math.max(ax, bx), Math.max(ay, by)],
       C: [rgba.r, rgba.g, rgba.b],
       Name: PDFName.of("Comment"),
       Open: false,
@@ -2695,14 +2871,14 @@ class DownloadManager {
   _getAnnotationMetadata(annotation) {
     const metadata = {};
 
-    // Author (T = title/author in PDF spec)
+    // Author (T = title/author in PDF spec). fromText encodes as UTF-16BE
+    // when needed; PDFString.of only covers PDFDocEncoding and mangles curly
+    // quotes, dashes, and names outside Latin-1.
     if (this.userName) {
-      metadata.T = PDFString.of(this.userName);
+      metadata.T = PDFHexString.fromText(this.userName);
     }
 
-    // Contents - a note's body, or the comment on any other annotation type.
-    // fromText encodes as UTF-16BE when needed; PDFString.of only covers
-    // PDFDocEncoding and mangles curly quotes, dashes, and the like.
+    // Contents - a note's body, or the comment on any other annotation type
     if (annotation.contents) {
       metadata.Contents = PDFHexString.fromText(annotation.contents);
     }
@@ -2848,6 +3024,9 @@ const Icons = {
   </svg>`
 };
 
+// Gap to keep between the dropdown and the edge it would otherwise cross (px)
+const EDGE_MARGIN = 8;
+
 class ColorPicker {
   static COLORS = [
     { name: "Orange", value: "#FFA500" },
@@ -2909,6 +3088,7 @@ class ColorPicker {
       this.isOpen = !this.isOpen;
       dropdown.classList.toggle("hidden", !this.isOpen);
       toggle.setAttribute("aria-expanded", this.isOpen);
+      if (this.isOpen) this._keepDropdownInView();
     });
 
     // Color selection
@@ -2930,6 +3110,49 @@ class ColorPicker {
     document.addEventListener("click", this._documentClickHandler);
   }
 
+  /**
+   * Slide the open dropdown sideways so every swatch can be reached.
+   *
+   * It opens aligned to the toggle, and the toggle can sit anywhere in the
+   * host's toolbar. Near the right edge the dropdown ran past the viewer,
+   * which clips its overflow, leaving the last colours cut off and unclickable.
+   */
+  _keepDropdownInView() {
+    const dropdown = this.element.querySelector(".color-picker-dropdown");
+
+    // Measure where the stylesheet puts it, without a previous shift
+    dropdown.style.transform = "";
+    const rect = dropdown.getBoundingClientRect();
+    const { left, right } = this._visibleBounds();
+
+    // Prefer showing the start of the row if it can't all fit
+    let shift = Math.min(0, right - EDGE_MARGIN - rect.right);
+    shift = Math.max(shift, left + EDGE_MARGIN - rect.left);
+
+    if (Math.abs(shift) >= 1) {
+      dropdown.style.transform = `translateX(${Math.round(shift)}px)`;
+    }
+  }
+
+  /**
+   * The horizontal extent the dropdown can be seen in: the window, narrowed
+   * by any ancestor that clips its overflow (the viewer's container does).
+   */
+  _visibleBounds() {
+    let left = 0;
+    let right = document.documentElement.clientWidth || window.innerWidth;
+
+    for (let node = this.element.parentElement; node && node !== document.documentElement; node = node.parentElement) {
+      if (getComputedStyle(node).overflowX === "visible") continue
+
+      const rect = node.getBoundingClientRect();
+      left = Math.max(left, rect.left);
+      right = Math.min(right, rect.right);
+    }
+
+    return { left, right }
+  }
+
   _closeDropdown() {
     this.isOpen = false;
     const dropdown = this.element.querySelector(".color-picker-dropdown");
@@ -2940,6 +3163,9 @@ class ColorPicker {
 
   setColor(color) {
     this.currentColor = color;
+
+    // Destroyed: there is no swatch to update and nobody left to notify
+    if (!this.element) return
 
     // Update toggle swatch
     const toggleSwatch = this.element.querySelector(".color-picker-toggle .color-picker-swatch");
@@ -3616,12 +3842,7 @@ class UndoBar {
   }
 
   _setupEventListeners() {
-    this.undoButton.addEventListener("click", () => {
-      if (this.currentAnnotation && this.onUndo) {
-        this.onUndo(this.currentAnnotation);
-      }
-      this.hide();
-    });
+    this.undoButton.addEventListener("click", () => this.undo());
 
     this.dismissButton.addEventListener("click", () => {
       this.hide();
@@ -3652,6 +3873,14 @@ class UndoBar {
     this.hideTimeout = setTimeout(() => {
       this.hide();
     }, AUTO_HIDE_DELAY);
+  }
+
+  /** Undo the deletion on offer, as the Undo button does. */
+  undo() {
+    if (this.currentAnnotation && this.onUndo) {
+      this.onUndo(this.currentAnnotation);
+    }
+    this.hide();
   }
 
   hide() {
@@ -6444,6 +6673,22 @@ class BaseTool {
     this.onPointerUp(event);
   }
 
+  /**
+   * Create an annotation from an event handler that nothing waits on.
+   *
+   * The annotation manager reports a failed save to the reader itself
+   * (pdf-viewer:error) and then rejects. Tools call it from pointer and click
+   * handlers, where that rejection has no one to catch it.
+   * @returns {Promise<Object|null>} The saved annotation, or null if saving failed
+   */
+  async _saveAnnotation(data) {
+    try {
+      return await this.annotationManager.createAnnotation(data)
+    } catch {
+      return null
+    }
+  }
+
   // Override in subclasses - pointer events work like mouse events but also support touch/pen
   onActivate() {}
   onDeactivate() {}
@@ -6987,6 +7232,7 @@ class HighlightTool extends TextSelectionTool {
     this.freehandPoints = [];
     this.freehandPageNumber = null;
     this.freehandCanvas = null;
+    this.freehandPointerId = null; // The pointer drawing the current stroke
 
     // Default freehand thickness (in pixels)
     this.freehandThickness = 24;
@@ -7060,6 +7306,10 @@ class HighlightTool extends TextSelectionTool {
   }
 
   onPointerDown(event) {
+    // A second pointer while a stroke is in progress (a resting palm, another
+    // finger) must not restart it; that would orphan the preview canvas
+    if (this.isFreehand) return
+
     // Ignore clicks on annotations or the edit toolbar
     if (event.target.closest(".annotation") || event.target.closest(".annotation-edit-toolbar")) {
       return
@@ -7092,6 +7342,7 @@ class HighlightTool extends TextSelectionTool {
 
   onPointerMove(event) {
     if (this.isFreehand) {
+      if (event.pointerId !== this.freehandPointerId) return
       this._continueFreehand(event);
     } else if (this.isTouchTextSelecting) {
       this._continueTouchTextSelection(event);
@@ -7099,6 +7350,9 @@ class HighlightTool extends TextSelectionTool {
   }
 
   async onPointerUp(event) {
+    // Only the pointer that is drawing ends the stroke
+    if (this.isFreehand && event.pointerId !== this.freehandPointerId) return
+
     // Release pointer capture if we have it
     const hasCapture = this.isFreehand || this.isTouchTextSelecting;
     if (hasCapture && event.target.hasPointerCapture?.(event.pointerId)) {
@@ -7134,9 +7388,18 @@ class HighlightTool extends TextSelectionTool {
         this._createTextHighlightFromData(rects, selectedText, textLayer);
       }
     } else if (this.isFreehand && this.freehandPoints.length > 1) {
-      // Freehand was drawn, create freehand highlight
-      // Keep preview visible until annotation is saved
-      await this._createFreehandHighlight();
+      // Freehand was drawn, create freehand highlight. Hand the stroke off
+      // and reset straight away so the next one can start while this saves;
+      // only its preview stays, until the saved annotation replaces it.
+      const points = this.freehandPoints;
+      const pageNumber = this.freehandPageNumber;
+      const preview = this.freehandCanvas;
+      this.freehandCanvas = null;
+      this._cleanupFreehand();
+
+      await this._createFreehandHighlight(points, pageNumber);
+      preview?.remove();
+      return
     }
 
     this._cleanupFreehand();
@@ -7153,6 +7416,7 @@ class HighlightTool extends TextSelectionTool {
 
     this.freehandPageNumber = parseInt(pageContainer.dataset.pageNumber, 10);
     this.isFreehand = true;
+    this.freehandPointerId = event.pointerId;
     this.freehandPoints = [{ x: event.clientX, y: event.clientY }];
 
     // Add drawing state class to maintain cursor during drag
@@ -7227,6 +7491,7 @@ class HighlightTool extends TextSelectionTool {
 
   _cleanupFreehand() {
     this.isFreehand = false;
+    this.freehandPointerId = null;
     this.freehandPoints = [];
     this.freehandPageNumber = null;
 
@@ -7256,8 +7521,8 @@ class HighlightTool extends TextSelectionTool {
     const color = this.pdfViewer.getHighlightColor() || ColorPicker.DEFAULT_HIGHLIGHT_COLOR;
 
     // Create annotation
-    await this.annotationManager.createAnnotation({
-      annotation_type: "highlight",
+    await this._saveAnnotation({
+      annotation_type: AnnotationType.HIGHLIGHT,
       page: pageNumber,
       quads: quads,
       rect: rect,
@@ -7268,17 +7533,17 @@ class HighlightTool extends TextSelectionTool {
     });
   }
 
-  async _createFreehandHighlight() {
-    if (this.freehandPoints.length < 2 || !this.freehandPageNumber) return
+  async _createFreehandHighlight(points, pageNumber) {
+    if (points.length < 2 || !pageNumber) return
 
-    const pageContainer = this.pdfViewer.viewer.getPageContainer(this.freehandPageNumber);
+    const pageContainer = this.pdfViewer.viewer.getPageContainer(pageNumber);
     if (!pageContainer) return
 
     const pageRect = pageContainer.getBoundingClientRect();
     const scale = this.pdfViewer.viewer.getScale();
 
     // Convert screen coordinates to PDF coordinates
-    const pdfPoints = this.freehandPoints.map(point => ({
+    const pdfPoints = points.map(point => ({
       x: (point.x - pageRect.left) / scale,
       y: (point.y - pageRect.top) / scale
     }));
@@ -7300,9 +7565,9 @@ class HighlightTool extends TextSelectionTool {
     const colorWithAlpha = baseColor + alphaHex;
 
     // Create ink annotation with highlight styling (thick stroke, low opacity)
-    await this.annotationManager.createAnnotation({
-      annotation_type: "ink",
-      page: this.freehandPageNumber,
+    await this._saveAnnotation({
+      annotation_type: AnnotationType.INK,
+      page: pageNumber,
       ink_strokes: [{ points: pdfPoints }],
       rect: [minX, minY, maxX - minX, maxY - minY],
       color: colorWithAlpha,
@@ -7338,7 +7603,7 @@ class UnderlineTool extends TextSelectionTool {
   }
 
   async createAnnotationFromSelection(selectedText, pageNumber, quads, rect) {
-    await this.annotationManager.createAnnotation({
+    await this._saveAnnotation({
       annotation_type: AnnotationType.UNDERLINE,
       page: pageNumber,
       quads: quads,
@@ -7470,22 +7735,21 @@ class NoteTool extends BaseTool {
 
     closeBtn.addEventListener("click", () => this._closeDialog());
 
-    saveBtn.addEventListener("click", async () => {
+    // Keep the dialog open if the save fails, so the text isn't lost and the
+    // reader can try again
+    const save = async () => {
+      const dialog = this.noteDialog;
       const text = textarea.value.trim();
-      if (text) {
-        await this._createNote(text);
-      }
-      this._closeDialog();
-    });
+      if (text && !(await this._createNote(text))) return
+      if (this.noteDialog === dialog) this._closeDialog();
+    };
+
+    saveBtn.addEventListener("click", save);
 
     // Save on Ctrl+Enter
     textarea.addEventListener("keydown", (e) => {
       if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
-        const text = textarea.value.trim();
-        if (text) {
-          this._createNote(text);
-        }
-        this._closeDialog();
+        save();
       } else if (e.key === "Escape") {
         e.preventDefault();
         e.stopPropagation();
@@ -7508,21 +7772,22 @@ class NoteTool extends BaseTool {
     this.pendingNote = null;
   }
 
+  /** @returns {Promise<Object|null>} The saved note, or null if it wasn't saved */
   async _createNote(text) {
-    if (!this.pendingNote) return
+    if (!this.pendingNote) return null
 
     const { pageNumber, x, y } = this.pendingNote;
     const color = this.pdfViewer.getHighlightColor() || ColorPicker.DEFAULT_HIGHLIGHT_COLOR;
 
     // Create annotation
-    await this.annotationManager.createAnnotation({
-      annotation_type: "note",
+    return this._saveAnnotation({
+      annotation_type: AnnotationType.NOTE,
       page: pageNumber,
       rect: [x, y, 24, 24], // Icon size
       contents: text,
       color: color,
       subject: "Comment"
-    });
+    })
   }
 
   // Method to edit an existing note or add/edit a comment on other annotation types
@@ -7543,7 +7808,7 @@ class NoteTool extends BaseTool {
     this.editingAnnotation = annotation;
 
     // Determine dialog title based on annotation type and whether contents exists
-    const isNote = annotation.annotation_type === "note";
+    const isNote = annotation.annotation_type === AnnotationType.NOTE;
     const hasContents = annotation.contents && annotation.contents.trim();
     let dialogTitle;
     if (isNote) {
@@ -7634,9 +7899,14 @@ class NoteTool extends BaseTool {
   }
 
   async _updateNote(annotationId, text) {
-    await this.annotationManager.updateAnnotation(annotationId, {
-      contents: text
-    });
+    try {
+      await this.annotationManager.updateAnnotation(annotationId, {
+        contents: text
+      });
+    } catch {
+      // The annotation manager has already reported the failure, and the
+      // dialog's handlers don't wait on this
+    }
     this.editingAnnotation = null;
   }
 
@@ -7658,6 +7928,8 @@ class InkTool extends BaseTool {
     this.currentStroke = null;
     this.currentPageNumber = null;
     this.drawingCanvas = null;
+    this.activePointerId = null; // The pointer drawing the current stroke
+    this.activePointerType = null;
     this.previousColor = null;
     this.inkColor = ColorPicker.DEFAULT_INK_COLOR;
 
@@ -7684,17 +7956,19 @@ class InkTool extends BaseTool {
     // Remember draw tool's current color before switching away
     this.inkColor = this.pdfViewer.colorPicker.currentColor;
 
-    // Save any pending strokes immediately
-    await this._savePendingStrokes();
-
-    // Clean up any in-progress drawing
-    this._cleanupCurrentStroke();
-
-    // Restore previous color when leaving draw mode
+    // Restore previous color when leaving draw mode. Do this before the save
+    // below: by the time the save settles the next tool may have set its own
+    // colour, or the viewer may have been destroyed along with the picker.
     if (this.previousColor) {
       this.pdfViewer.colorPicker.setColor(this.previousColor);
       this.previousColor = null;
     }
+
+    // Clean up any in-progress drawing
+    this._cleanupCurrentStroke();
+
+    // Save any pending strokes immediately
+    await this._savePendingStrokes();
   }
 
   _addTouchListeners() {
@@ -7727,7 +8001,19 @@ class InkTool extends BaseTool {
     }
   }
 
-  async onPointerDown(event) {
+  onPointerDown(event) {
+    // A second pointer while a stroke is in progress must not start another:
+    // that orphaned the first stroke's canvas and mixed both pointers' moves
+    // into one stroke. Two fingers are a pinch, so drop the stroke and let the
+    // zoom happen; anything else (a palm resting beside the pen) is ignored.
+    if (this.isDrawing) {
+      if (this.activePointerType === "touch" && event.pointerType === "touch") {
+        this.pdfViewer.pagesContainer.classList.remove("is-drawing");
+        this._cleanupCurrentStroke();
+      }
+      return
+    }
+
     // Find which page we're on
     const pageContainer = event.target.closest(".pdf-page");
     if (!pageContainer) return
@@ -7737,13 +8023,18 @@ class InkTool extends BaseTool {
 
     const pageNumber = parseInt(pageContainer.dataset.pageNumber, 10);
 
-    // If drawing on a different page, save pending strokes first
+    // If drawing on a different page, save the previous page's strokes. Don't
+    // wait for the save: setPointerCapture below only works while the pointer
+    // is still down, and a quick pen stroke can lift before a request returns.
+    // The batch is handed off synchronously, so the new stroke starts clean.
     if (this.pendingStrokes.length > 0 && this.pendingPageNumber !== pageNumber) {
-      await this._savePendingStrokes();
+      this._savePendingStrokes();
     }
 
     this.currentPageNumber = pageNumber;
     this.isDrawing = true;
+    this.activePointerId = event.pointerId;
+    this.activePointerType = event.pointerType;
     this.currentStroke = {
       points: [{ x: event.clientX, y: event.clientY }]
     };
@@ -7762,6 +8053,7 @@ class InkTool extends BaseTool {
 
   onPointerMove(event) {
     if (!this.isDrawing || !this.currentStroke) return
+    if (event.pointerId !== this.activePointerId) return
 
     // Dedupe consecutive identical points
     const lastPoint = this.currentStroke.points[this.currentStroke.points.length - 1];
@@ -7773,6 +8065,7 @@ class InkTool extends BaseTool {
 
   async onPointerUp(event) {
     if (!this.isDrawing || !this.currentStroke) return
+    if (event.pointerId !== this.activePointerId) return
 
     // Release pointer capture
     if (event.target.hasPointerCapture?.(event.pointerId)) {
@@ -7945,13 +8238,18 @@ class InkTool extends BaseTool {
     try {
       // Create annotation
       await this.annotationManager.createAnnotation({
-        annotation_type: "ink",
+        annotation_type: AnnotationType.INK,
         page: pageNumber,
         ink_strokes: inkStrokes,
         rect: [minX, minY, maxX - minX, maxY - minY],
         color: color,
         subject: "Free Hand"
       });
+    } catch {
+      // The annotation manager has already reported the failure to the reader
+      // (pdf-viewer:error). Callers fire this from a timer, a pointerdown and
+      // teardown without waiting on it, so rethrowing only adds an unhandled
+      // rejection on top of the message they have already seen.
     } finally {
       // Always remove the temp preview elements, even if the save failed —
       // otherwise they're orphaned in the DOM with no remaining reference.
@@ -7964,27 +8262,13 @@ class InkTool extends BaseTool {
   _cleanupCurrentStroke() {
     this.currentStroke = null;
     this.isDrawing = false;
+    this.activePointerId = null;
+    this.activePointerType = null;
 
     if (this.drawingCanvas) {
       this.drawingCanvas.remove();
       this.drawingCanvas = null;
     }
-  }
-
-  destroy() {
-    if (this.saveTimeout) {
-      clearTimeout(this.saveTimeout);
-      this.saveTimeout = null;
-    }
-    // Remove any temp elements
-    for (const stroke of this.pendingStrokes) {
-      if (stroke.tempElement) {
-        stroke.tempElement.remove();
-      }
-    }
-    this.pendingStrokes = [];
-    this._cleanupCurrentStroke();
-    super.destroy();
   }
 }
 
@@ -8025,6 +8309,10 @@ class PdfViewer {
     // in one shot on destroy(); some live on the global document and would
     // otherwise leak the viewer across reconnects.
     this._abortController = new AbortController();
+
+    // Set by destroy(). load() is async and can still be waiting on the
+    // document or its annotations when the host tears the viewer down.
+    this._destroyed = false;
 
     // Take a reference on the shared announcer; released in destroy(). Done
     // unconditionally (even if _initializeComponents bails early) so it stays
@@ -8282,6 +8570,17 @@ class PdfViewer {
       this._deselectAnnotation();
     }, { signal });
 
+    // Ctrl/Cmd+Z restores the annotation the undo bar is offering. Only while
+    // the bar is showing, and never while typing, where it is the field's own undo.
+    document.addEventListener("keydown", (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey || e.key?.toLowerCase() !== "z") return
+      if (e.target.closest?.("input, textarea, select, [contenteditable]")) return
+      if (!this.undoBar?.currentAnnotation) return
+
+      e.preventDefault();
+      this.undoBar.undo();
+    }, { signal });
+
     // Handle error events from annotation manager and other components
     this.container.addEventListener("pdf-viewer:error", (e) => {
       this._handleError(e.detail);
@@ -8311,6 +8610,7 @@ class PdfViewer {
     try {
       // Load the PDF document
       await this.viewer.load(this.documentUrl);
+      if (this._destroyed) return
 
       // Initialize find controller with the loaded document
       if (this.findController && this.viewer.pdfDocument) {
@@ -8320,12 +8620,19 @@ class PdfViewer {
       // Initialize thumbnail sidebar with the loaded document
       if (this.thumbnailSidebar && this.viewer.pdfDocument) {
         await this.thumbnailSidebar.setDocument(this.viewer.pdfDocument);
+        if (this._destroyed) return
       }
 
       // Load existing annotations from store and render them on all rendered
       // pages. Skipped for encrypted documents, which are view-only.
       if (!this.readOnly) {
-        await this.annotationManager.loadAnnotations();
+        try {
+          await this.annotationManager.loadAnnotations();
+        } catch {
+          // The document itself is fine, so keep it readable. The manager has
+          // already reported the failure to the reader (pdf-viewer:error).
+        }
+        if (this._destroyed) return
         this._renderAnnotations();
       }
 
@@ -8341,6 +8648,7 @@ class PdfViewer {
       const openedAtDestination = this.initialDestination
         ? await this.goToDestination(this.initialDestination)
         : false;
+      if (this._destroyed) return
       if (!openedAtDestination && this.initialPage > 1) {
         this.viewer.goToPage(this.initialPage);
       }
@@ -8357,6 +8665,10 @@ class PdfViewer {
       // Start time tracking
       this._startTracking();
     } catch (error) {
+      // Tearing the viewer down aborts a load in progress; that is not a
+      // failure to report
+      if (this._destroyed) return
+
       console.error("Failed to load PDF viewer:", error);
       throw error
     }
@@ -8615,12 +8927,27 @@ class PdfViewer {
     }
   }
 
+  // Delete and undo are fired from click and key handlers that don't wait on
+  // them. The annotation manager reports a failure itself (pdf-viewer:error),
+  // so rethrowing here would only add an unhandled rejection.
   async _onAnnotationDelete(annotation) {
-    await this.annotationManager.deleteAnnotation(annotation.id);
+    try {
+      await this.annotationManager.deleteAnnotation(annotation.id);
+    } catch {
+      // Already reported
+    }
   }
 
   async _onAnnotationUndo(annotation) {
-    await this.annotationManager.restoreAnnotation(annotation.id);
+    let restored;
+    try {
+      restored = await this.annotationManager.restoreAnnotation(annotation.id);
+    } catch {
+      return // Already reported
+    }
+    // A store that can't restore returns nothing; don't claim it worked
+    if (!restored) return
+
     this._renderAnnotationsForPage(annotation.page, this.viewer.getPageContainer(annotation.page));
 
     // Announce to screen readers
@@ -9275,9 +9602,16 @@ class PdfViewer {
 
   async _onAnnotationColorChange(annotation, color) {
     try {
-      // Preserve the existing opacity when changing color (default to 0.4 for highlights/ink, 1 for others)
-      const defaultOpacity = (annotation.annotation_type === AnnotationType.HIGHLIGHT || annotation.annotation_type === AnnotationType.INK) ? 0.4 : 1;
-      const opacity = annotation.opacity ?? defaultOpacity;
+      // Preserve the existing opacity when changing color. A store need not
+      // return an opacity field, so fall back to the alpha already encoded in
+      // the color, then to the type's default: 0.4 for highlights (text and
+      // freehand), 1 for everything else. Pen drawings are ink too, and are opaque.
+      const isHighlight = annotation.annotation_type === AnnotationType.HIGHLIGHT || isFreeHighlight(annotation);
+      const existing = annotation.color || "";
+      const alphaInColor = existing.length === 9 && existing.startsWith("#")
+        ? parseInt(existing.slice(7, 9), 16) / 255
+        : NaN;
+      const opacity = annotation.opacity ?? (Number.isNaN(alphaInColor) ? (isHighlight ? 0.4 : 1) : alphaInColor);
 
       // Encode opacity into color string as alpha channel (#RRGGBBAA)
       // The backend derives opacity from the color's alpha channel
@@ -9374,20 +9708,29 @@ class PdfViewer {
 
   // Time tracking
   _startTracking() {
+    this._trackingStarted = true;
+    // A document opened in a background tab isn't being read yet
+    if (!document.hidden) this._resumeTracking();
+  }
+
+  // Stop the clock while the tab is hidden. The heartbeat has to stop too:
+  // timers keep firing in a background tab, and each beat would report the
+  // time since the last one as time spent reading.
+  _pauseTracking() {
+    if (!this._trackingInterval) return
+
+    clearInterval(this._trackingInterval);
+    this._trackingInterval = null;
+    this._sendTrackingUpdate();
+  }
+
+  _resumeTracking() {
+    if (!this._trackingStarted || this._trackingInterval) return
+
     this._trackingStartTime = Date.now();
     this._trackingInterval = setInterval(() => {
       this._sendTrackingUpdate();
     }, 30000); // 30 second heartbeat
-  }
-
-  _pauseTracking() {
-    if (this._trackingInterval) {
-      this._sendTrackingUpdate();
-    }
-  }
-
-  _resumeTracking() {
-    this._trackingStartTime = Date.now();
   }
 
   _sendTrackingUpdate() {
@@ -9396,13 +9739,16 @@ class PdfViewer {
     const timeSpent = Math.floor((Date.now() - this._trackingStartTime) / 1000);
     this._trackingStartTime = Date.now();
 
+    const headers = { "Content-Type": "application/json" };
+    const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content;
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+
     fetch(this.trackingUrl, {
       method: "PATCH",
-      headers: {
-        "Content-Type": "application/json",
-        "X-CSRF-Token": document.querySelector('meta[name="csrf-token"]')?.content
-      },
-      body: JSON.stringify({ time_spent: timeSpent })
+      headers,
+      body: JSON.stringify({ time_spent: timeSpent }),
+      // Let the last update outlive the page when it is sent on the way out
+      keepalive: true
     }).catch(error => {
       console.error("Failed to send tracking update:", error);
     });
@@ -9425,13 +9771,19 @@ class PdfViewer {
 
   // Cleanup
   destroy() {
+    this._destroyed = true;
+
     // Remove the document/container listeners from _setupEventListeners()
     this._abortController.abort();
 
-    if (this._trackingInterval) {
-      clearInterval(this._trackingInterval);
-      this._sendTrackingUpdate();
-    }
+    // Report the time since the last heartbeat, unless the tab is hidden and
+    // the clock is already stopped
+    this._pauseTracking();
+    this._trackingStarted = false;
+
+    // Tools first: deactivating one calls back into the UI below (the ink
+    // tool restores the colour picker), so that UI must still exist.
+    Object.values(this.tools || {}).forEach(tool => tool.destroy?.());
 
     // Optional-chain every component: _initializeComponents() can bail out
     // early (e.g. missing .pdf-pages-container), leaving these undefined, and
@@ -9447,8 +9799,6 @@ class PdfViewer {
     this.colorPicker?.destroy();
     this.passwordPrompt?.destroy();
     this.linkLayer?.destroy();
-
-    Object.values(this.tools || {}).forEach(tool => tool.destroy?.());
 
     // Clean up the shared announcer
     destroyAnnouncer();
@@ -9504,9 +9854,14 @@ class pdf_viewer_controller extends Controller {
     this._setupErrorListener();
 
     // Load the PDF
+    const pdfViewer = this.pdfViewer;
     try {
-      await this.pdfViewer.load();
+      await pdfViewer.load();
     } catch (error) {
+      // Disconnected (or reconnected with a new viewer) while loading: this
+      // failure belongs to a viewer that is gone, so there is nothing to show
+      if (this.pdfViewer !== pdfViewer) return
+
       console.error("Failed to load PDF:", error);
       this._handleLoadFailure(error);
     }
